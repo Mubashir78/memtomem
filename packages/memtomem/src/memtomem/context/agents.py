@@ -40,11 +40,26 @@ from typing import Any, Protocol
 
 from memtomem.context import _skip_reasons as skip_codes
 from memtomem.context._atomic import atomic_write_bytes, atomic_write_text
-from memtomem.context._names import InvalidNameError, validate_name
+from memtomem.context._names import InvalidNameError, Layout, validate_name
 
 logger = logging.getLogger(__name__)
 
 CANONICAL_AGENT_ROOT = ".memtomem/agents"
+AGENT_DIR_FILENAME = "agent.md"
+
+
+def canonical_agent_name(path: Path, layout: Layout) -> str:
+    """Single source of truth for agent path → name dispatch.
+
+    Used by :func:`list_canonical_agents` consumers, the web routes import
+    handler, and any other place that needs the canonical name without
+    re-implementing the layout fallback. The brittle
+    ``path.name == "agent.md"`` heuristic is intentionally avoided —
+    callers must pass the layout tag they got from
+    :func:`list_canonical_agents` or :func:`extract_agents_to_canonical`.
+    """
+    return path.parent.name if layout == "dir" else path.stem
+
 
 # Reuse the same frontmatter regex used by the markdown chunker so canonical
 # agent files parse consistently with the rest of memtomem.
@@ -171,8 +186,15 @@ _KNOWN_AGENT_KEYS = frozenset(
 )
 
 
-def parse_canonical_agent(path: Path) -> SubAgent:
-    """Parse a canonical agent file into a :class:`SubAgent`."""
+def parse_canonical_agent(path: Path, *, layout: Layout = "flat") -> SubAgent:
+    """Parse a canonical agent file into a :class:`SubAgent`.
+
+    ``layout`` selects the default-name fallback when the frontmatter omits
+    ``name``: ``"flat"`` (legacy ``agents/<name>.md``) uses ``path.stem``;
+    ``"dir"`` (ADR-0008 ``agents/<name>/agent.md``) uses
+    ``path.parent.name``. Callers normally get ``layout`` from
+    :func:`list_canonical_agents`.
+    """
     content = path.read_text(encoding="utf-8")
     # Normalize CRLF → LF so ``_FRONT_MATTER_RE`` (which anchors on ``\n``) matches
     # files authored on Windows or by editors that emit CRLF.
@@ -188,7 +210,8 @@ def parse_canonical_agent(path: Path) -> SubAgent:
 
     body = content[m.end() :].lstrip("\n").rstrip() + "\n"
 
-    name = frontmatter.get("name") or path.stem
+    default_name = path.parent.name if layout == "dir" else path.stem
+    name = frontmatter.get("name") or default_name
     try:
         name = validate_name(str(name), kind="agent name")
     except InvalidNameError as exc:
@@ -207,11 +230,39 @@ def parse_canonical_agent(path: Path) -> SubAgent:
     )
 
 
-def list_canonical_agents(project_root: Path) -> list[Path]:
+def list_canonical_agents(project_root: Path) -> list[tuple[Path, Layout]]:
+    """Enumerate canonical agents in both flat and directory layouts.
+
+    Flat layout (legacy): ``agents/<name>.md``. Directory layout (ADR-0008
+    PR-C+): ``agents/<name>/agent.md``. When the same name has both forms,
+    the directory layout wins and a WARNING is logged so the silent flat
+    file is visible. ``mm context migrate`` (PR-D) is the supported way
+    to consolidate.
+    """
     root = project_root / CANONICAL_AGENT_ROOT
     if not root.is_dir():
         return []
-    return sorted(p for p in root.glob("*.md") if p.is_file())
+
+    flat: dict[str, Path] = {p.stem: p for p in sorted(root.glob("*.md")) if p.is_file()}
+    dirs: dict[str, Path] = {}
+    for entry in sorted(root.iterdir()):
+        if entry.is_dir():
+            agent_md = entry / AGENT_DIR_FILENAME
+            if agent_md.is_file():
+                dirs[entry.name] = agent_md
+
+    for name in sorted(set(flat) & set(dirs)):
+        logger.warning(
+            "agents/%s: both flat (%s.md) and dir (%s/agent.md) layouts present; "
+            "using dir. Remove the flat file or run `mm context migrate` (PR-D).",
+            name,
+            name,
+            name,
+        )
+
+    merged_paths = {**flat, **dirs}  # dir overrides flat on collision
+    layouts: dict[str, Layout] = {**dict.fromkeys(flat, "flat"), **dict.fromkeys(dirs, "dir")}
+    return [(merged_paths[k], layouts[k]) for k in sorted(merged_paths)]
 
 
 # ── Renderers ────────────────────────────────────────────────────────
@@ -446,9 +497,16 @@ class AgentSyncResult:
 
 @dataclass
 class ExtractResult:
-    """Result of a reverse (runtime → canonical) import."""
+    """Result of a reverse (runtime → canonical) import.
 
-    imported: list[Path]
+    Each entry in ``imported`` is ``(path, layout)`` so consumers can use
+    :func:`canonical_agent_name` without re-deriving the layout from the
+    path. ``layout`` is whichever form the canonical now lives in on disk
+    (preserving an existing flat file or writing a new dir entry — see
+    :func:`_resolve_agent_extract_target`).
+    """
+
+    imported: list[tuple[Path, Layout]]
     # (item_name, human_reason, reason_code) — see :mod:`memtomem.context._skip_reasons`.
     skipped: list[tuple[str, str, skip_codes.SkipCode]] = field(default_factory=list)
 
@@ -498,9 +556,9 @@ def generate_all_agents(
         if gen is None:
             skipped.append((target, "unknown runtime", skip_codes.UNKNOWN_RUNTIME))
             continue
-        for agent_path in canonicals:
+        for agent_path, layout in canonicals:
             try:
-                agent = parse_canonical_agent(agent_path)
+                agent = parse_canonical_agent(agent_path, layout=layout)
             except AgentParseError as exc:
                 skipped.append((agent_path.name, f"parse error: {exc}", skip_codes.PARSE_ERROR))
                 continue
@@ -524,6 +582,36 @@ def generate_all_agents(
 # ── Reverse: runtime → canonical ────────────────────────────────────
 
 
+def _resolve_agent_extract_target(canonical_root: Path, agent_name: str) -> tuple[Path, Layout]:
+    """Decide where reverse-sync writes the canonical for ``agent_name``.
+
+    Truth table (ADR-0008 PR-C):
+      dir+flat both → dir wins, flat is silently divergent → WARN
+      dir only      → dir
+      flat only     → flat (preserve existing layout; PR-C does not migrate)
+      neither       → dir (ADR-0008 layout for new agents)
+    """
+    dir_target = canonical_root / agent_name / AGENT_DIR_FILENAME
+    flat_target = canonical_root / f"{agent_name}.md"
+    has_dir = dir_target.is_file()
+    has_flat = flat_target.is_file()
+    if has_dir and has_flat:
+        logger.warning(
+            "agents/%s: reverse-sync updates dir layout (%s/agent.md); the flat "
+            "file (%s.md) is now silently divergent. Remove it or run "
+            "`mm context migrate` (PR-D).",
+            agent_name,
+            agent_name,
+            agent_name,
+        )
+        return dir_target, "dir"
+    if has_dir:
+        return dir_target, "dir"
+    if has_flat:
+        return flat_target, "flat"
+    return dir_target, "dir"
+
+
 def extract_agents_to_canonical(
     project_root: Path,
     overwrite: bool = False,
@@ -542,9 +630,13 @@ def extract_agents_to_canonical(
     silently skipped before any validation/dedupe work. Callers (e.g. the
     single-item import route) can detect "no such runtime artifact" by
     inspecting an empty ``imported`` + ``skipped``.
+
+    Layout policy: new agents (no existing canonical) land in directory
+    layout per ADR-0008. Existing flat-layout entries are preserved by
+    PR-C — migration to directory layout is a separate command (PR-D).
     """
     canonical_root = project_root / CANONICAL_AGENT_ROOT
-    imported: list[Path] = []
+    imported: list[tuple[Path, Layout]] = []
     skipped: list[tuple[str, str, skip_codes.SkipCode]] = []
     seen: dict[str, str] = {}  # agent_name → first runtime label
 
@@ -574,15 +666,16 @@ def extract_agents_to_canonical(
                 skipped.append((agent_name, reason, skip_codes.ALREADY_IMPORTED))
                 logger.warning("skip %s from %s: %s", agent_name, runtime_label, reason)
                 continue
-            dst = canonical_root / f"{agent_name}.md"
+            dst, layout = _resolve_agent_extract_target(canonical_root, agent_name)
             if dst.exists() and not overwrite:
                 reason = "canonical exists (use --overwrite)"
                 skipped.append((agent_name, reason, skip_codes.CANONICAL_EXISTS))
                 logger.warning("skip %s from %s: %s", agent_name, runtime_label, reason)
                 seen[agent_name] = runtime_label
                 continue
+            dst.parent.mkdir(parents=True, exist_ok=True)
             atomic_write_bytes(dst, md_file.read_bytes())
-            imported.append(dst)
+            imported.append((dst, layout))
             seen[agent_name] = runtime_label
 
     return ExtractResult(imported=imported, skipped=skipped)
@@ -616,7 +709,11 @@ def diff_agents(project_root: Path) -> list[tuple[str, str, str]]:
     ``"parse error"``.
     """
     results: list[tuple[str, str, str]] = []
-    canonical_names = {p.stem for p in list_canonical_agents(project_root)}
+    canonical_index = {
+        path.parent.name if layout == "dir" else path.stem: (path, layout)
+        for path, layout in list_canonical_agents(project_root)
+    }
+    canonical_names = set(canonical_index)
 
     for gen_name, gen in AGENT_GENERATORS.items():
         runtime_names = _runtime_agent_names(gen_name, project_root)
@@ -628,9 +725,9 @@ def diff_agents(project_root: Path) -> list[tuple[str, str, str]]:
                 results.append((gen_name, name, "missing canonical"))
                 continue
 
-            src = project_root / CANONICAL_AGENT_ROOT / f"{name}.md"
+            src, layout = canonical_index[name]
             try:
-                agent = parse_canonical_agent(src)
+                agent = parse_canonical_agent(src, layout=layout)
             except AgentParseError:
                 results.append((gen_name, name, "parse error"))
                 continue
@@ -646,6 +743,7 @@ def diff_agents(project_root: Path) -> list[tuple[str, str, str]]:
 
 
 __all__ = [
+    "AGENT_DIR_FILENAME",
     "AGENT_GENERATORS",
     "AgentGenerator",
     "AgentParseError",
@@ -655,9 +753,11 @@ __all__ = [
     "ClaudeAgentsGenerator",
     "CodexAgentsGenerator",
     "GeminiAgentsGenerator",
+    "Layout",
     "ON_DROP_LEVELS",
     "StrictDropError",
     "SubAgent",
+    "canonical_agent_name",
     "diff_agents",
     "extract_agents_to_canonical",
     "generate_all_agents",

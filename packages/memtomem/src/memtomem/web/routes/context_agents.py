@@ -17,6 +17,7 @@ from memtomem.context.agents import (
     CANONICAL_AGENT_ROOT,
     AgentParseError,
     SubAgent,
+    canonical_agent_name,
     diff_agents,
     extract_agents_to_canonical,
     generate_all_agents,
@@ -87,8 +88,10 @@ async def list_agents(
         by_name.setdefault(agent_name, []).append({"runtime": runtime, "status": status})
 
     agents: list[dict[str, object]] = []
-    for agent_path in canonicals:
-        name = agent_path.stem
+    canonical_names: set[str] = set()
+    for agent_path, layout in canonicals:
+        name = canonical_agent_name(agent_path, layout)
+        canonical_names.add(name)
         agents.append(
             {
                 "name": name,
@@ -97,7 +100,6 @@ async def list_agents(
             }
         )
 
-    canonical_names = {p.stem for p in canonicals}
     for agent_name, runtimes in by_name.items():
         if agent_name not in canonical_names:
             agents.append({"name": agent_name, "canonical_path": None, "runtimes": runtimes})
@@ -406,8 +408,11 @@ async def import_agents(
         raise HTTPException(503, "Agents import timed out — another sync may be in progress")
     return {
         "imported": [
-            {"name": p.stem, "canonical_path": str(p.relative_to(project_root))}
-            for p in result.imported
+            {
+                "name": canonical_agent_name(p, layout),
+                "canonical_path": str(p.relative_to(project_root)),
+            }
+            for p, layout in result.imported
         ],
         "skipped": [
             {"name": name, "reason": reason, "reason_code": code}
@@ -448,8 +453,11 @@ async def import_agent(
         raise HTTPException(404, f"No runtime agent named {name!r} to import")
     return {
         "imported": [
-            {"name": p.stem, "canonical_path": str(p.relative_to(project_root))}
-            for p in result.imported
+            {
+                "name": canonical_agent_name(p, layout),
+                "canonical_path": str(p.relative_to(project_root)),
+            }
+            for p, layout in result.imported
         ],
         "skipped": [
             {"name": n, "reason": reason, "reason_code": code} for n, reason, code in result.skipped

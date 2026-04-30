@@ -16,6 +16,7 @@ from memtomem.context.commands import (
     CANONICAL_COMMAND_ROOT,
     COMMAND_GENERATORS,
     CommandParseError,
+    canonical_command_name,
     diff_commands,
     extract_commands_to_canonical,
     generate_all_commands,
@@ -73,8 +74,10 @@ async def list_commands(
         by_name.setdefault(cmd_name, []).append({"runtime": runtime, "status": status})
 
     commands: list[dict[str, object]] = []
-    for cmd_path in canonicals:
-        name = cmd_path.stem
+    canonical_names: set[str] = set()
+    for cmd_path, layout in canonicals:
+        name = canonical_command_name(cmd_path, layout)
+        canonical_names.add(name)
         commands.append(
             {
                 "name": name,
@@ -83,7 +86,6 @@ async def list_commands(
             }
         )
 
-    canonical_names = {p.stem for p in canonicals}
     for cmd_name, runtimes in by_name.items():
         if cmd_name not in canonical_names:
             commands.append({"name": cmd_name, "canonical_path": None, "runtimes": runtimes})
@@ -382,8 +384,11 @@ async def import_commands(
         raise HTTPException(503, "Commands import timed out — another sync may be in progress")
     return {
         "imported": [
-            {"name": p.stem, "canonical_path": str(p.relative_to(project_root))}
-            for p in result.imported
+            {
+                "name": canonical_command_name(p, layout),
+                "canonical_path": str(p.relative_to(project_root)),
+            }
+            for p, layout in result.imported
         ],
         "skipped": [
             {"name": name, "reason": reason, "reason_code": code}
@@ -424,8 +429,11 @@ async def import_command(
         raise HTTPException(404, f"No runtime command named {name!r} to import")
     return {
         "imported": [
-            {"name": p.stem, "canonical_path": str(p.relative_to(project_root))}
-            for p in result.imported
+            {
+                "name": canonical_command_name(p, layout),
+                "canonical_path": str(p.relative_to(project_root)),
+            }
+            for p, layout in result.imported
         ],
         "skipped": [
             {"name": n, "reason": reason, "reason_code": code} for n, reason, code in result.skipped

@@ -13,6 +13,7 @@ from memtomem.context.agents import (
     _runtime_agent_names,
     _toml_escape_basic_string,
     _toml_escape_multiline_string,
+    canonical_agent_name,
     diff_agents,
     extract_agents_to_canonical,
     generate_all_agents,
@@ -147,7 +148,7 @@ class TestListCanonicalAgents:
     def test_sorted(self, tmp_path):
         _make_canonical_agent(tmp_path, "zeta", SAMPLE_MINIMAL_AGENT.replace("helper", "zeta"))
         _make_canonical_agent(tmp_path, "alpha", SAMPLE_MINIMAL_AGENT.replace("helper", "alpha"))
-        names = [p.stem for p in list_canonical_agents(tmp_path)]
+        names = [p.stem for p, _layout in list_canonical_agents(tmp_path)]
         assert names == ["alpha", "zeta"]
 
 
@@ -284,7 +285,8 @@ class TestExtractAgentsToCanonical:
         (claude_dir / "helper.md").write_text(SAMPLE_MINIMAL_AGENT, encoding="utf-8")
         result = extract_agents_to_canonical(tmp_path)
         assert len(result.imported) == 1
-        assert (tmp_path / CANONICAL_AGENT_ROOT / "helper.md").is_file()
+        # New agents land in directory layout per ADR-0008.
+        assert (tmp_path / CANONICAL_AGENT_ROOT / "helper" / "agent.md").is_file()
         assert result.skipped == []
 
     def test_dedup_across_runtimes(self, tmp_path):
@@ -341,7 +343,9 @@ class TestExtractAgentsToCanonical:
         result = extract_agents_to_canonical(tmp_path)
 
         # Only "ok" imported; "-bad" skipped with invalid-name reason.
-        imported_names = sorted(p.stem for p in result.imported)
+        # ExtractResult.imported is now (path, layout) tuples; new agents
+        # land in dir layout per ADR-0008.
+        imported_names = sorted(canonical_agent_name(p, layout) for p, layout in result.imported)
         assert imported_names == ["ok"]
         skipped_names = sorted(name for name, _, _ in result.skipped)
         assert "-bad" in skipped_names
@@ -355,9 +359,10 @@ class TestExtractAgentsToCanonical:
         (d / "beta.md").write_text(SAMPLE_MINIMAL_AGENT, encoding="utf-8")
 
         result = extract_agents_to_canonical(tmp_path, only_name="alpha")
-        assert [p.stem for p in result.imported] == ["alpha"]
+        # ExtractResult.imported is (path, layout) tuples.
+        assert [canonical_agent_name(p, layout) for p, layout in result.imported] == ["alpha"]
         assert result.skipped == []
-        assert not (tmp_path / CANONICAL_AGENT_ROOT / "beta.md").exists()
+        assert not (tmp_path / CANONICAL_AGENT_ROOT / "beta" / "agent.md").exists()
 
     def test_only_name_no_match_returns_empty(self, tmp_path):
         d = tmp_path / ".claude/agents"
@@ -532,7 +537,10 @@ class TestRoundtrip:
         shutil.rmtree(tmp_path / CANONICAL_AGENT_ROOT)
         result = extract_agents_to_canonical(tmp_path)
         assert len(result.imported) == 1
-        reparsed = parse_canonical_agent(tmp_path / CANONICAL_AGENT_ROOT / "helper.md")
+        # New canonical lands in dir layout per ADR-0008.
+        reparsed = parse_canonical_agent(
+            tmp_path / CANONICAL_AGENT_ROOT / "helper" / "agent.md", layout="dir"
+        )
         assert reparsed.name == "helper"
         assert "Help with things." in reparsed.body
 
