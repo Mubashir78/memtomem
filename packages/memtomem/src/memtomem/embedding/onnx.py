@@ -8,26 +8,11 @@ from collections.abc import Callable
 from typing import Sequence
 
 from memtomem.config import EmbeddingConfig
+from memtomem.embedding.aliases import resolve_embedder_id
 from memtomem.embedding.fastembed_cache import resolve_fastembed_cache_dir
 from memtomem.errors import EmbeddingError
 
 logger = logging.getLogger(__name__)
-
-# Short name -> (fastembed model ID, dimension).
-# Users may also pass a raw fastembed model ID via config.model.
-_ONNX_MODELS: dict[str, tuple[str, int]] = {
-    "all-MiniLM-L6-v2": ("sentence-transformers/all-MiniLM-L6-v2", 384),
-    "bge-small-en-v1.5": ("BAAI/bge-small-en-v1.5", 384),
-    "bge-m3": ("BAAI/bge-m3", 1024),
-}
-
-
-def _resolve_model(name: str) -> str:
-    """Map a short model name to the fastembed model ID."""
-    entry = _ONNX_MODELS.get(name)
-    if entry:
-        return entry[0]
-    return name  # pass through as raw fastembed model ID
 
 
 def _register_custom_models_if_needed() -> None:
@@ -68,6 +53,12 @@ class OnnxEmbedder:
     def __init__(self, config: EmbeddingConfig) -> None:
         self._config = config
         self._model: object | None = None  # fastembed.TextEmbedding
+        # Observability flags read by ``GET /api/system/model-readiness``.
+        # Plain attribute reads/writes — bool/Optional[str] assignment is
+        # atomic under CPython, and the readiness endpoint is allowed to
+        # observe transient states without taking a lock.
+        self._loading: bool = False
+        self._load_error: str | None = None
 
     def _get_model(self) -> object:
         """Lazily initialise the fastembed model (downloads on first use)."""
@@ -82,7 +73,7 @@ class OnnxEmbedder:
             ) from exc
 
         _register_custom_models_if_needed()
-        model_id = _resolve_model(self._config.model)
+        model_id = resolve_embedder_id(self._config.model)
         # threads=0 → leave ORT default (all physical cores); threads>0 caps
         # the intra-op pool so seeding doesn't saturate the machine.
         threads = self._config.threads or None
@@ -93,7 +84,17 @@ class OnnxEmbedder:
             threads if threads is not None else "ORT default",
             cache_dir,
         )
-        self._model = TextEmbedding(model_name=model_id, threads=threads, cache_dir=str(cache_dir))
+        self._loading = True
+        self._load_error = None
+        try:
+            self._model = TextEmbedding(
+                model_name=model_id, threads=threads, cache_dir=str(cache_dir)
+            )
+        except Exception as exc:
+            self._load_error = str(exc)
+            raise
+        finally:
+            self._loading = False
         return self._model
 
     @property

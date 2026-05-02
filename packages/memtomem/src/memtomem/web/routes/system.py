@@ -59,6 +59,9 @@ from memtomem.web.schemas.config import (
     EmbeddingConfigInfo,
     EmbeddingResetResponse,
     EmbeddingStatusResponse,
+    ModelComponent,
+    ModelComponentState,
+    ModelReadinessResponse,
     PrivacyPatternEntry,
     PrivacyPatternsResponse,
 )
@@ -747,6 +750,116 @@ async def get_embedding_status(storage=Depends(get_storage)) -> EmbeddingStatusR
         model_mismatch=mismatch["model_mismatch"],
         stored=EmbeddingConfigInfo(**mismatch["stored"]),
         configured=EmbeddingConfigInfo(**mismatch["configured"]),
+    )
+
+
+# Providers that route through the lazy fastembed loaders we instrumented
+# for #696 — i.e. ones where introspecting ``_model`` / ``_loading`` /
+# ``_load_error`` is meaningful. The embedder advertises this path as
+# ``"onnx"``; the reranker advertises it as ``"fastembed"``. Other
+# providers (Ollama/Cohere/local) have their own connection-based
+# readiness model and are reported as ``state="skipped"``.
+_INTROSPECTABLE_PROVIDERS = {"onnx", "fastembed"}
+
+
+def _component_for(
+    *,
+    provider: str,
+    model: str | None,
+    holder: object | None,
+    enabled: bool,
+) -> ModelComponent:
+    """Build a ``ModelComponent`` snapshot for one lazy loader.
+
+    ``holder`` is either an ``OnnxEmbedder`` / ``FastEmbedReranker`` (with
+    ``_model``, ``_loading``, ``_load_error`` flags introduced for #696)
+    or ``None`` when the component is disabled. ``enabled=False`` short-
+    circuits to ``state="skipped"`` regardless of the holder.
+    """
+    from memtomem.embedding.aliases import approx_size_mb, resolve_embedder_id
+    from memtomem.embedding.fastembed_cache import resolve_fastembed_cache_dir
+    from memtomem.embedding.readiness import model_snapshot_present
+
+    if not enabled or provider not in _INTROSPECTABLE_PROVIDERS or holder is None:
+        return ModelComponent(state="skipped", provider=provider, model=model)
+
+    # Embedder config stores either a short alias (``bge-m3``) or the
+    # raw fastembed id; the reranker config always stores the full
+    # fastembed id directly. ``resolve_embedder_id`` is a no-op for
+    # already-resolved ids, so it's safe to apply uniformly.
+    fastembed_id = resolve_embedder_id(model) if model else None
+    cache_present = False
+    if fastembed_id:
+        try:
+            cache_dir = resolve_fastembed_cache_dir()
+            cache_present = model_snapshot_present(cache_dir, fastembed_id)
+        except Exception:
+            # Resolving the cache dir or stat'ing it should never raise in
+            # practice; fall through to ``cache_present=False`` so the
+            # endpoint still returns a meaningful state.
+            logger.debug("model_snapshot_present probe failed", exc_info=True)
+
+    loaded = getattr(holder, "_model", None) is not None
+    loading = bool(getattr(holder, "_loading", False))
+    load_error = getattr(holder, "_load_error", None)
+
+    if load_error:
+        state: ModelComponentState = "error"
+    elif loaded:
+        state = "ready"
+    elif loading:
+        state = "downloading" if not cache_present else "loading"
+    else:
+        state = "cold"
+
+    return ModelComponent(
+        state=state,
+        provider=provider,
+        model=model,
+        cache_present=cache_present,
+        approx_size_mb=approx_size_mb(fastembed_id) if fastembed_id else None,
+        error=load_error,
+    )
+
+
+@router.get("/system/model-readiness", response_model=ModelReadinessResponse)
+async def get_model_readiness(
+    request: Request,
+    embedder=Depends(get_embedder),
+    config=Depends(get_config),
+) -> ModelReadinessResponse:
+    """Snapshot the load state of the embedder + reranker (issue #696).
+
+    Read-only: inspects the lazy loaders' ``_model`` / ``_loading`` /
+    ``_load_error`` flags and probes the fastembed cache directory. Never
+    triggers a model download itself — the Web UI banner polls this while
+    waiting for ``state="ready"`` so the user sees what's happening
+    instead of a frozen Search button.
+    """
+    emb_cfg = config.embedding
+    embedder_component = _component_for(
+        provider=emb_cfg.provider,
+        model=emb_cfg.model,
+        holder=embedder,
+        enabled=True,
+    )
+
+    # Reranker: lives on the SearchPipeline. ``app.state.search_pipeline``
+    # always exists (lifespan creates it), but ``_reranker`` is None when
+    # ``config.rerank.enabled is False`` — skip the readiness check then.
+    rerank_cfg = config.rerank
+    pipeline = getattr(request.app.state, "search_pipeline", None)
+    reranker_holder = getattr(pipeline, "_reranker", None) if pipeline else None
+    reranker_component = _component_for(
+        provider=rerank_cfg.provider,
+        model=rerank_cfg.model if rerank_cfg.enabled else None,
+        holder=reranker_holder,
+        enabled=rerank_cfg.enabled,
+    )
+
+    return ModelReadinessResponse(
+        embedder=embedder_component,
+        reranker=reranker_component,
     )
 
 
