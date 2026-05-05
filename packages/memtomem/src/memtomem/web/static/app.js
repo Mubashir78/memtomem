@@ -322,25 +322,35 @@ async function apiWithRedactionRetry(method, path, body, opts = {}) {
 // returns HTTP 200 with per-file ``error="redaction_blocked (hits=N)"``
 // strings (system.py:1161) instead of a structured 403, so the dialog is
 // driven off the per-file error scan rather than a typed exception. On
-// confirm, re-issues the same FormData with ``?force_unsafe=true``;
-// the retry is non-conflicting (not strictly idempotent) — already-OK
-// files get re-written under a ``_{mtime_ns}`` suffix by the server
-// (system.py:1121), so the same content is indexed twice under two
-// filenames. Acceptable trade-off given the rarity of mixed batches.
+// confirm, re-issues a *narrowed* FormData containing only the blocked
+// entries with ``?force_unsafe=true``; clean files from the first pass
+// are already persisted server-side and are not re-sent (issue #803 —
+// the previous full-batch retry let the server's ``_{mtime_ns}``
+// collision suffix at system.py:1121 silently duplicate every clean
+// file in any mixed batch, since that suffix was meant for genuine
+// name collisions, not retry-batch deduplication).
+//
+// The retry result rows are merged back into the original ``data.files``
+// at their original positions, so the caller renders one row per input
+// file regardless of which pass produced it.
 //
 // Returns ``{data, cancelled, bypassed, blockedFileCount}``: ``data`` is
-// the response to render, ``cancelled`` is true when the user declined
-// the bypass (caller should still render ``data`` to surface the
-// per-file errors), ``bypassed`` is true on a successful retry, and
-// ``blockedFileCount`` is the number of files that triggered the guard
-// (used by callers to localize the cancel-toast).
+// the (merged) response to render, ``cancelled`` is true when the user
+// declined the bypass (caller should still render ``data`` to surface
+// the per-file errors), ``bypassed`` is true only when **every** blocked
+// row came back from the retry without an ``error`` field (a partial or
+// malformed retry response keeps ``bypassed`` false and substitutes
+// ``toast.redaction_bypass_partial`` for the success toast — see the
+// validation block below), and ``blockedFileCount`` is the number of
+// files that triggered the guard (used by callers to localize the
+// cancel-toast).
 const _UPLOAD_REDACTION_BLOCKED_RE = /^redaction_blocked \(hits=(\d+)\)$/;
 async function uploadFilesWithRedactionRetry(formData) {
-  async function _post(forceUnsafe) {
+  async function _post(form, forceUnsafe) {
     const csrf = await ensureCsrfToken();
     const headers = csrf ? { 'X-Memtomem-CSRF': csrf } : {};
     const url = forceUnsafe ? '/api/upload?force_unsafe=true' : '/api/upload';
-    const res = await fetch(url, { method: 'POST', body: formData, headers });
+    const res = await fetch(url, { method: 'POST', body: form, headers });
     if (!res.ok) {
       const err = await res.json().catch(() => ({ detail: res.statusText }));
       const detail = err.detail;
@@ -354,18 +364,21 @@ async function uploadFilesWithRedactionRetry(formData) {
     return res.json();
   }
 
-  const data = await _post(false);
-  const blockedHits = (data.files || [])
-    .map(r => {
-      const m = r.error && r.error.match(_UPLOAD_REDACTION_BLOCKED_RE);
-      return m ? parseInt(m[1], 10) : 0;
-    })
-    .filter(n => n > 0);
-  if (!blockedHits.length) {
+  const data = await _post(formData, false);
+  // Walk per-file rows once, recording (rowIndex, hits) pairs for blocked
+  // entries. Index-based matching handles duplicate basenames in the same
+  // batch — the server tags rows positionally (one result per ``files``
+  // entry, in order), and we mirror that here when narrowing the retry.
+  const blockedRows = [];
+  (data.files || []).forEach((r, i) => {
+    const m = r.error && r.error.match(_UPLOAD_REDACTION_BLOCKED_RE);
+    if (m) blockedRows.push({ index: i, hits: parseInt(m[1], 10) });
+  });
+  if (!blockedRows.length) {
     return { data, cancelled: false, bypassed: false, blockedFileCount: 0 };
   }
 
-  const totalHits = blockedHits.reduce((a, b) => a + b, 0);
+  const totalHits = blockedRows.reduce((a, r) => a + r.hits, 0);
   const surfaceKey = 'surface.web_api_upload';
   const localized = t(surfaceKey);
   const surfaceLabel = localized === surfaceKey ? 'web_api_upload' : localized;
@@ -378,12 +391,73 @@ async function uploadFilesWithRedactionRetry(formData) {
     confirmText: t('confirm.redaction_blocked_proceed'),
   });
   if (!ok) {
-    return { data, cancelled: true, bypassed: false, blockedFileCount: blockedHits.length };
+    return { data, cancelled: true, bypassed: false, blockedFileCount: blockedRows.length };
   }
 
-  const retryData = await _post(true);
-  showToast(t('toast.redaction_bypassed', { hits: totalHits }), 'info');
-  return { data: retryData, cancelled: false, bypassed: true, blockedFileCount: blockedHits.length };
+  // Build a narrowed FormData with only the blocked entries, preserving
+  // original order. ``getAll('files')`` returns the entries in insertion
+  // order, so blockedRows[k].index aligns with allFiles[blockedRows[k].index].
+  const allFiles = formData.getAll('files');
+  const retryForm = new FormData();
+  for (const row of blockedRows) retryForm.append('files', allFiles[row.index]);
+  const retryData = await _post(retryForm, true);
+
+  // Merge retry rows back into their original positions. The server
+  // returns retry results in the same order as the narrowed FormData,
+  // so retryData.files[k] corresponds to blockedRows[k].
+  const mergedFiles = (data.files || []).slice();
+  const retryFiles = retryData.files || [];
+  retryFiles.forEach((row, k) => {
+    if (k < blockedRows.length) mergedFiles[blockedRows[k].index] = row;
+  });
+  const mergedData = {
+    ...data,
+    files: mergedFiles,
+    total_indexed: mergedFiles.reduce((s, r) => s + (r.indexed_chunks || 0), 0),
+  };
+
+  // Validate that the bypass actually wrote every blocked file. ``/api/upload``
+  // reports per-file failures inside an HTTP-200 response, so a clean status
+  // alone is not proof that the retry landed — emitting
+  // ``toast.redaction_bypassed`` ("entry written") on a malformed or partially
+  // failed retry would falsely audit a non-write. Two ways the retry can lie:
+  //   - ``retryFiles.length !== blockedRows.length`` (server returned fewer
+  //     rows than we re-sent — shape regression or upstream truncation).
+  //   - any retry row still carries ``error`` (force_unsafe was honored at the
+  //     route level but the per-file write hit a different failure, e.g. a
+  //     non-redaction validation error or a second redaction class the bypass
+  //     didn't cover).
+  // On either, suppress the bypass-success toast and emit
+  // ``toast.redaction_bypass_partial`` with the actual succeeded/total counts
+  // so the operator sees that some blocked files did not land. ``bypassed``
+  // tracks the same boolean so callers can branch off it.
+  //
+  // ``succeededCount`` is clamped to ``blockedRows.length`` rows so that an
+  // over-long retry response (server returns more rows than we re-sent —
+  // shape regression in the other direction) cannot produce nonsense counts
+  // like "3 of 2 written" in the partial toast.
+  const succeededCount = retryFiles
+    .slice(0, blockedRows.length)
+    .filter(r => !r.error).length;
+  const fullySucceeded =
+    retryFiles.length === blockedRows.length && succeededCount === blockedRows.length;
+  if (fullySucceeded) {
+    showToast(t('toast.redaction_bypassed', { hits: totalHits }), 'info');
+  } else {
+    showToast(
+      t('toast.redaction_bypass_partial', {
+        succeeded: succeededCount,
+        total: blockedRows.length,
+      }),
+      'error',
+    );
+  }
+  return {
+    data: mergedData,
+    cancelled: false,
+    bypassed: fullySucceeded,
+    blockedFileCount: blockedRows.length,
+  };
 }
 
 function qs(id) { return document.getElementById(id); }
@@ -4082,17 +4156,51 @@ qs('add-btn').addEventListener('click', async () => {
         }
         result.appendChild(row);
       });
+      // Mixed-batch refresh: the first ``_post(false)`` already persisted /
+      // indexed every clean file in the batch (only the redaction-blocked
+      // rows came back with an ``error`` field). Whether the user proceeds,
+      // cancels, or the retry partially succeeds, the stats / source filter
+      // / usage panels are stale and must refresh — the early-return cancel
+      // path used to skip them, leaving the per-file result list showing
+      // newly saved files while the rest of the UI lagged behind. Drop
+      // through to the unified refresh below in every branch.
       if (upload.cancelled) {
         showToast(t('toast.upload_redaction_cancelled', { count: upload.blockedFileCount }), 'error');
-        return;
+        // Prune already-landed clean files from the selection so a
+        // user-driven re-upload doesn't trip the server's
+        // ``_{mtime_ns}`` collision suffix on rows that already exist on
+        // disk (issue #803 — the same dup-write the narrowed retry
+        // FormData fixed). The first-pass response aligns positionally
+        // with ``selectedFiles`` (one row per input file, in order), so
+        // an index-based filter is duplicate-basename-safe.
+        selectedFiles = selectedFiles.filter((_, i) => data.files[i]?.error);
+        renderFileList();
+      } else {
+        // Partial bypass: helper already emitted ``toast.redaction_bypass_partial``
+        // with the succeeded/total counts. Skip the generic "Upload complete"
+        // success toast (it would falsely audit a successful write on top of
+        // the partial warning).
+        const partial = upload.blockedFileCount > 0 && !upload.bypassed;
+        if (!partial) {
+          const firstPath = data.files.find(r => !r.error && r.path)?.path;
+          const successMsg = firstPath
+            ? t('toast.upload_complete_with_path', { count: data.total_indexed, path: tildifyPath(firstPath) })
+            : t('toast.upload_complete', { count: data.total_indexed });
+          showToast(successMsg, 'success');
+          selectedFiles = [];
+          renderFileList();
+        } else {
+          // Same prune as the cancel branch: clean files from the first
+          // pass and any retry rows that landed are now on disk; only
+          // rows that still carry ``error`` in mergedData should remain
+          // selected so a follow-up Upload click sends just the unwritten
+          // ones. Without this prune, partial bypass is functionally
+          // identical to the original #803 dup bug for users who retry
+          // after a partial outcome.
+          selectedFiles = selectedFiles.filter((_, i) => data.files[i]?.error);
+          renderFileList();
+        }
       }
-      const firstPath = data.files.find(r => !r.error && r.path)?.path;
-      const successMsg = firstPath
-        ? t('toast.upload_complete_with_path', { count: data.total_indexed, path: tildifyPath(firstPath) })
-        : t('toast.upload_complete', { count: data.total_indexed });
-      showToast(successMsg, 'success');
-      selectedFiles = [];
-      renderFileList();
       _markDataStale();
       loadSourceFilter();
       loadStats();
@@ -5598,10 +5706,26 @@ qs('group-toggle').addEventListener('click', () => {
     showToast(t('toast.indexing_files', { count: files.length }), 'info');
     try {
       const upload = await uploadFilesWithRedactionRetry(fd);
-      if (upload.cancelled) return;
       const data = upload.data;
-      const chunks = (data.results || []).reduce((s, r) => s + (r.indexed_chunks || 0), 0);
-      showToast(t('toast.indexed_files_chunks', { files: files.length, chunks }), 'success');
+      // Mixed-batch refresh: same rationale as upload-mode caller — the
+      // first POST already indexed clean files even when the user later
+      // cancels the bypass dialog. Unlike the upload tab there is no
+      // per-file result list here, so without a cancel toast the operator
+      // has zero signal that some files DID land. Surface the cancel toast
+      // and drop through to the staleness refresh in every branch.
+      if (upload.cancelled) {
+        showToast(t('toast.upload_redaction_cancelled', { count: upload.blockedFileCount }), 'error');
+      } else {
+        // On partial bypass the helper already surfaced the per-file
+        // failure via ``toast.redaction_bypass_partial``; suppress the
+        // generic success toast here so the audit-relevant warning isn't
+        // followed by a contradicting "indexed N files" message.
+        const partial = upload.blockedFileCount > 0 && !upload.bypassed;
+        if (!partial) {
+          const chunks = (data.results || []).reduce((s, r) => s + (r.indexed_chunks || 0), 0);
+          showToast(t('toast.indexed_files_chunks', { files: files.length, chunks }), 'success');
+        }
+      }
       _markDataStale();
       loadSourceFilter();
       loadStats();
