@@ -90,6 +90,149 @@ class TestScan:
         assert privacy.scan("AKIAIOSFODNN7EXAMPLE", patterns=()) == []
 
 
+class TestEnforceWriteGuard:
+    """Helper unit tests. The wire-in tests for individual surfaces
+    (``mem_add`` / ``mem_edit`` / Web routes / CLI / LangGraph) live in
+    ``test_memory_crud_redaction.py`` and ``test_redaction_write_surfaces.py``.
+    The unit-level pin here measures the helper's contract directly so a
+    surface-level regression cannot mask a helper-level bug.
+    """
+
+    def test_clean_content_records_pass_and_returns_empty_hits(self):
+        before = privacy.snapshot()["outcomes"]["pass"]
+        result = privacy.enforce_write_guard(
+            "Just a normal note about Q2 plans.", surface="unit_pass"
+        )
+        after = privacy.snapshot()["outcomes"]["pass"]
+
+        assert result.decision == "pass"
+        assert result.hits == []
+        assert after == before + 1
+
+    def test_secret_without_force_unsafe_records_blocked(self):
+        before = privacy.snapshot()["outcomes"]["blocked"]
+        result = privacy.enforce_write_guard("secret = sk-" + "a" * 30, surface="unit_block")
+        after = privacy.snapshot()["outcomes"]["blocked"]
+
+        assert result.decision == "blocked"
+        assert result.hits, "blocked decision must surface hit count to caller"
+        assert after == before + 1
+
+    def test_secret_with_force_unsafe_records_bypassed_and_audit_logs(self, caplog):
+        before = privacy.snapshot()["outcomes"]["bypassed"]
+        with caplog.at_level(logging.WARNING, logger="memtomem.privacy"):
+            result = privacy.enforce_write_guard(
+                "secret = sk-" + "a" * 30,
+                surface="unit_bypass",
+                force_unsafe=True,
+                audit_context={"namespace": "default", "file": "notes.md"},
+            )
+        after = privacy.snapshot()["outcomes"]["bypassed"]
+
+        assert result.decision == "bypassed"
+        assert result.hits
+        assert after == before + 1
+        assert "redaction bypass" in caplog.text
+        assert "surface=unit_bypass" in caplog.text
+        # audit_context fields appear in the log line so operators can
+        # correlate, but the secret bytes themselves never do.
+        assert "namespace='default'" in caplog.text
+        assert "file='notes.md'" in caplog.text
+        assert "sk-" not in caplog.text, "Matched bytes must never reach the audit log"
+
+    def test_clean_content_with_force_unsafe_records_pass_not_bypassed(self):
+        """``bypassed`` only fires on a real hit. A clean write with the
+        flag set is no different from a clean write without it — pin so
+        the bypass label keeps measuring real escape-hatch usage rather
+        than degrading into "kwarg was passed."
+        """
+        before = privacy.snapshot()["outcomes"]
+        result = privacy.enforce_write_guard(
+            "Plain prose, nothing sensitive.",
+            surface="unit_clean_force",
+            force_unsafe=True,
+        )
+        after = privacy.snapshot()["outcomes"]
+
+        assert result.decision == "pass"
+        assert after["pass"] == before["pass"] + 1
+        assert after["bypassed"] == before["bypassed"]
+
+    def test_secret_in_audit_context_value_is_redacted(self, caplog):
+        """User-controllable audit-context fields (file path, upload
+        filename, scratch key) can themselves embed the same secret
+        that's being bypassed. The helper must scrub those values
+        before they reach the audit log — otherwise the "matched bytes
+        never reach logs" goal is undermined exactly when a bypass
+        gets recorded.
+        """
+        secret = "sk-" + "a" * 30
+        with caplog.at_level(logging.WARNING, logger="memtomem.privacy"):
+            privacy.enforce_write_guard(
+                f"the body contains {secret}",
+                surface="unit_ctx_redact",
+                force_unsafe=True,
+                audit_context={
+                    "file": f"/tmp/notes-{secret}.md",
+                    "namespace": "default",
+                    "filename": f"{secret}.md",
+                    "item_idx": 3,
+                },
+            )
+        line = next(
+            (r.getMessage() for r in caplog.records if "redaction bypass" in r.getMessage()),
+            "",
+        )
+        assert secret not in line, f"Audit log leaked the matched bytes: {line!r}"
+        # The redaction marker takes the value's place so operators see
+        # the field was scrubbed rather than missing.
+        assert "<redacted: secret-shape>" in line
+        # Non-secret context fields and non-string values pass through.
+        assert "namespace='default'" in line
+        assert "item_idx=3" in line
+
+    def test_long_audit_context_string_is_truncated(self, caplog):
+        long_clean = "x" * 5000
+        with caplog.at_level(logging.WARNING, logger="memtomem.privacy"):
+            privacy.enforce_write_guard(
+                "secret = sk-" + "a" * 30,
+                surface="unit_ctx_truncate",
+                force_unsafe=True,
+                audit_context={"path": long_clean},
+            )
+        line = next(
+            (r.getMessage() for r in caplog.records if "redaction bypass" in r.getMessage()),
+            "",
+        )
+        assert "...(truncated)" in line
+        # Truncation cap keeps the line compact even with abusive context.
+        assert len(line) < 1000
+
+    def test_audit_log_without_context_still_records_shape_metadata(self, caplog):
+        """An ``audit_context=None`` bypass still emits the structured
+        ``surface=…, content_chars=…, hits=…`` triple. The
+        ``audit_context`` block is optional sugar for downstream
+        forensics; the core shape is always present.
+        """
+        with caplog.at_level(logging.WARNING, logger="memtomem.privacy"):
+            privacy.enforce_write_guard(
+                "secret = sk-" + "a" * 30,
+                surface="unit_no_ctx",
+                force_unsafe=True,
+            )
+        line = next(
+            (r.getMessage() for r in caplog.records if "redaction bypass" in r.getMessage()),
+            "",
+        )
+        assert "surface=unit_no_ctx" in line
+        assert "content_chars=" in line
+        assert "hits=" in line
+        # No double-comma artefact from an empty context block.
+        assert ", , " not in line
+        # Matched bytes never leak into the log line.
+        assert "sk-" not in line
+
+
 class TestCounter:
     def test_record_increments_outcome_and_by_tool(self):
         privacy.record("blocked", "mem_add")

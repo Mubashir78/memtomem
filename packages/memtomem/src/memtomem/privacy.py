@@ -321,3 +321,139 @@ def reset_for_tests() -> None:
         for o in _VALID_OUTCOMES:
             _outcomes[o] = 0
         _by_tool.clear()
+
+
+@dataclass(frozen=True)
+class WriteGuardResult:
+    """Outcome of a single ``enforce_write_guard`` call.
+
+    ``decision`` is one of ``_VALID_OUTCOMES``. ``hits`` is the raw
+    ``scan()`` result so callers can size-quote it in user-facing
+    errors (length only, never the matched bytes).
+    """
+
+    decision: str
+    hits: list[RedactionHit]
+
+
+_AUDIT_VALUE_MAX_LEN = 200
+_AUDIT_REDACTED_MARKER = "<redacted: secret-shape>"
+
+
+def _sanitize_audit_value(value: object) -> object:
+    """Strip secret-shaped substrings from a single audit-context value.
+
+    The helper's audit log emits ``audit_context`` after ``surface=`` so
+    operators can correlate a bypass with the request shape (path, key,
+    namespace, etc). Several callers pass user-controllable strings —
+    file paths, upload filenames, scratch keys — and a bypass that
+    happens to embed the same secret in those fields would otherwise
+    leak it through the log line.
+
+    Non-string values (``None``, ``int``, ``bool``) pass through. Strings
+    are re-scanned with the same ``DEFAULT_PATTERNS`` used for content;
+    any hit replaces the value entirely with a fixed marker, and very
+    long strings are truncated so a multi-megabyte path can't blow up
+    the audit line either.
+    """
+    if not isinstance(value, str):
+        return value
+    if scan(value):
+        return _AUDIT_REDACTED_MARKER
+    if len(value) > _AUDIT_VALUE_MAX_LEN:
+        return value[:_AUDIT_VALUE_MAX_LEN] + "...(truncated)"
+    return value
+
+
+def emit_bypass_audit(
+    *,
+    surface: str,
+    content_chars: int,
+    hits: int,
+    audit_context: dict[str, object] | None = None,
+) -> None:
+    """Emit a structured ``redaction bypass`` warning with sanitized context.
+
+    Public seam for callers that pre-scan their own content and cannot
+    route through :func:`enforce_write_guard` — currently
+    ``mem_batch_add``'s transactional path, which decides per-item
+    bypass after a whole-batch hit-collection pass and therefore
+    can't take :class:`WriteGuardResult` 's single-content shape.
+    Funnelling that callsite through this helper instead of an ad-hoc
+    ``logger.warning`` keeps the "matched bytes never reach logs"
+    invariant in one place: every audit value passes through
+    :func:`_sanitize_audit_value` first.
+
+    The corresponding counter (:func:`record`) is intentionally **not**
+    bumped here — callers that have their own per-item bookkeeping
+    (again, ``mem_batch_add``) own the counter contract and would
+    double-count if this helper also recorded.
+    """
+    if audit_context:
+        sanitized = {k: _sanitize_audit_value(v) for k, v in audit_context.items()}
+        ctx_pairs = ", " + ", ".join(f"{k}={v!r}" for k, v in sanitized.items())
+    else:
+        ctx_pairs = ""
+    logger.warning(
+        "redaction bypass via force_unsafe=True (surface=%s%s, content_chars=%d, hits=%d)",
+        surface,
+        ctx_pairs,
+        content_chars,
+        hits,
+    )
+
+
+def enforce_write_guard(
+    content: str,
+    *,
+    surface: str,
+    force_unsafe: bool = False,
+    audit_context: dict[str, object] | None = None,
+) -> WriteGuardResult:
+    """Trust-boundary content scan + counter increment + audit log.
+
+    Centralises the redaction guard so every ingress surface (MCP
+    ``mem_add`` / ``mem_edit``, Web ``POST /api/add`` / ``POST /upload``
+    / ``PATCH /chunks/{id}`` / scratch promote, CLI ``mm add`` / shell
+    ``add`` / agent share, and the LangGraph integration) shares one
+    scan-decide-log shape. ``surface`` is the audit identifier passed
+    to ``record()``.
+
+    On a hit:
+
+    - ``force_unsafe=True`` records ``"bypassed"`` and emits a
+      structured audit log line. Extra request shape (namespace, file,
+      route, item_idx, …) is rendered from ``audit_context`` as
+      ``key=value`` pairs **after** the ``surface=`` field. Each
+      audit value is run through ``_sanitize_audit_value`` first so a
+      secret embedded in a user-controlled string field (path,
+      filename, key) cannot leak through the bypass log either —
+      matched bytes never reach error messages, audit lines, or
+      response bodies.
+    - ``force_unsafe=False`` records ``"blocked"`` and returns a
+      result whose ``decision == "blocked"``. The caller picks the
+      user-facing error message (HTTP 403 / CLI exception / MCP error
+      string) so each surface keeps its native error shape.
+
+    The ``mem_batch_add`` path does not call this helper — its
+    per-entry decision shape (one rejection invalidates the whole
+    batch, but counters still attribute outcomes per item) is fiddly
+    enough that inlining the scan + record pattern there is clearer
+    than wrapping it in a sequence of helper calls. ``record(...)`` is
+    still the shared counter API.
+    """
+    hits = scan(content)
+    if not hits:
+        record("pass", surface)
+        return WriteGuardResult("pass", [])
+    if force_unsafe:
+        record("bypassed", surface)
+        emit_bypass_audit(
+            surface=surface,
+            content_chars=len(content),
+            hits=len(hits),
+            audit_context=audit_context,
+        )
+        return WriteGuardResult("bypassed", hits)
+    record("blocked", surface)
+    return WriteGuardResult("blocked", hits)
