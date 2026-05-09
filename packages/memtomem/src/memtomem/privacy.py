@@ -436,6 +436,7 @@ def enforce_write_guard(
     force_unsafe: bool = False,
     scope: str = "user",
     audit_context: dict[str, object] | None = None,
+    record_outcome: bool = True,
 ) -> WriteGuardResult:
     """Trust-boundary content scan + counter increment + audit log.
 
@@ -477,36 +478,38 @@ def enforce_write_guard(
       memory is ``scope="project_local"`` (gitignored) or
       ``scope="user"`` (private to the user).
 
-    The ``mem_batch_add`` path does not call this helper — its
-    per-entry decision shape (one rejection invalidates the whole
-    batch, but counters still attribute outcomes per item) is fiddly
-    enough that inlining the scan + record pattern there is clearer
-    than wrapping it in a sequence of helper calls. ``record(...)`` is
-    still the shared counter API. PR-D refactors that path to route
-    through this helper per entry so the project_shared refusal
-    cannot become the bypass route.
+    Transactional callers (``mem_batch_add``) pass
+    ``record_outcome=False`` so the per-entry decisions can be
+    collected without committing counters; the caller then runs
+    :func:`record` once it has decided whether to commit the whole
+    batch. This preserves the "no pass record on rejected batch"
+    invariant the batch path relies on for clean audit semantics.
     """
     hits = scan(content)
     if not hits:
-        record("pass", surface)
+        if record_outcome:
+            record("pass", surface)
         return WriteGuardResult("pass", [])
     if force_unsafe and scope == "project_shared":
-        record("blocked_project_shared", surface)
-        emit_bypass_audit(
-            surface=surface,
-            content_chars=len(content),
-            hits=len(hits),
-            audit_context={**(audit_context or {}), "blocked_scope": "project_shared"},
-        )
+        if record_outcome:
+            record("blocked_project_shared", surface)
+            emit_bypass_audit(
+                surface=surface,
+                content_chars=len(content),
+                hits=len(hits),
+                audit_context={**(audit_context or {}), "blocked_scope": "project_shared"},
+            )
         return WriteGuardResult("blocked_project_shared", hits)
     if force_unsafe:
-        record("bypassed", surface)
-        emit_bypass_audit(
-            surface=surface,
-            content_chars=len(content),
-            hits=len(hits),
-            audit_context=audit_context,
-        )
+        if record_outcome:
+            record("bypassed", surface)
+            emit_bypass_audit(
+                surface=surface,
+                content_chars=len(content),
+                hits=len(hits),
+                audit_context=audit_context,
+            )
         return WriteGuardResult("bypassed", hits)
-    record("blocked", surface)
+    if record_outcome:
+        record("blocked", surface)
     return WriteGuardResult("blocked", hits)

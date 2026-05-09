@@ -53,39 +53,67 @@ async def _mem_add_core(
     template: str | None,
     ctx: CtxType,
     force_unsafe: bool = False,
+    scope: str = "user",
+    confirm_project_shared: bool = False,
 ) -> tuple[str, "IndexingStats | None"]:
     """Core logic for ``mem_add`` — also usable from internal callers that
     need the ``IndexingStats`` (e.g. ``mem_consolidate_apply`` linking new
     summary chunks by id without the old ``recall_chunks(limit=1)`` race).
 
+    ``scope`` is ADR-0011 Gate B: passing anything other than ``"user"``
+    requires explicit caller intent. ``project_shared`` additionally
+    requires ``confirm_project_shared=True`` (the gate-B confirm
+    surrogate for MCP callers; the CLI uses an interactive prompt).
+
     Returns:
         Tuple of ``(user_facing_message, stats)``. ``stats`` is ``None``
         for early error returns (empty content, oversized content,
         redaction-guard hit without ``force_unsafe``, template failure,
-        invalid path) so callers must tolerate ``None``.
+        invalid path, missing project_shared confirm) so callers must
+        tolerate ``None``.
     """
     if not content.strip():
         return ("Error: content cannot be empty.", None)
     if len(content) > MAX_CONTENT_LENGTH:
         return ("Error: content too large (max 100,000 characters).", None)
 
-    # Trust-boundary redaction guard — see ``memtomem.privacy`` module
-    # docstring for the rationale and the cross-repo sync rule. Runs
-    # before any filesystem write so a flagged write leaves no on-disk
-    # trace to clean up.
+    # ADR-0011 Gate B (surface layer). project_shared writes go to git;
+    # require explicit confirm so MCP callers cannot silently commit
+    # PII to a tracked tier through a default-bool oversight.
+    if scope == "project_shared" and not confirm_project_shared:
+        return (
+            "Error: scope='project_shared' writes to a git-tracked "
+            "directory. Pass confirm_project_shared=True to proceed.",
+            None,
+        )
+
+    # ADR-0011 Gate A (chokepoint). enforce_write_guard hard-refuses
+    # ``force_unsafe=True`` when scope=='project_shared'; this branch
+    # therefore cannot reach the bypass path even if a future caller
+    # accidentally wires force_unsafe through.
     from memtomem import privacy
 
     guard = privacy.enforce_write_guard(
         content,
         surface="mem_add",
         force_unsafe=force_unsafe,
-        audit_context={"namespace": namespace, "file": file},
+        scope=scope,
+        audit_context={"namespace": namespace, "file": file, "scope": scope},
     )
     if guard.decision == "blocked":
         return (
             f"Error: content matches {len(guard.hits)} privacy pattern(s); "
             "write rejected. Retry with force_unsafe=True to bypass "
             "(audit-logged).",
+            None,
+        )
+    if guard.decision == "blocked_project_shared":
+        return (
+            f"Error: content matches {len(guard.hits)} privacy pattern(s) "
+            "and force_unsafe=True is not permitted on scope='project_shared' "
+            "(git history is forever). Retry with scope='project_local' "
+            "or scope='user' to bypass; manually edit the canonical file "
+            "if a project_shared write is required.",
             None,
         )
 
@@ -184,6 +212,8 @@ async def mem_add(
     namespace: str | None = None,
     template: str | None = None,
     force_unsafe: bool = False,
+    scope: str = "user",
+    confirm_project_shared: bool = False,
     ctx: CtxType = None,
 ) -> str:
     """Add a new memory entry to a markdown file and immediately index it.
@@ -230,6 +260,8 @@ async def mem_add(
         namespace=namespace,
         template=template,
         force_unsafe=force_unsafe,
+        scope=scope,
+        confirm_project_shared=confirm_project_shared,
         ctx=ctx,
     )
     return message
@@ -257,6 +289,13 @@ async def mem_edit(
     ``force_unsafe=True``; bypass events are audit-logged. See
     ``mem_add_redaction_stats`` for the counter snapshot.
 
+    ADR-0011: the gate's scope is **inferred from the loaded chunk**,
+    not from a caller parameter. Editing a chunk whose persisted
+    ``scope == 'project_shared'`` enforces the same hard-refusal of
+    ``force_unsafe=True`` that applies to ``mem_add(scope='project_shared',
+    ...)`` — a client cannot bypass Gate A by omitting an explicit
+    scope kwarg on the edit path.
+
     Args:
         chunk_id: The UUID of the chunk to edit (shown in mem_search results)
         new_content: The replacement body. Heading + per-entry metadata
@@ -270,18 +309,6 @@ async def mem_edit(
 
     from memtomem import privacy
     from memtomem.tools.memory_writer import replace_chunk_body
-
-    guard = privacy.enforce_write_guard(
-        new_content,
-        surface="mem_edit",
-        force_unsafe=force_unsafe,
-        audit_context={"chunk_id": chunk_id},
-    )
-    if guard.decision == "blocked":
-        return (
-            f"Error: new_content matches {len(guard.hits)} privacy pattern(s); "
-            "edit rejected. Retry with force_unsafe=True to bypass (audit-logged)."
-        )
 
     app = await _get_app_initialized(ctx)
     mismatch_msg = _check_embedding_mismatch(app)
@@ -298,6 +325,31 @@ async def mem_edit(
         return f"Error: chunk {chunk_id} not found."
 
     meta = chunk.metadata
+
+    # ADR-0011: infer scope from the loaded chunk's persisted metadata.
+    # The privacy gate sees the same scope the chunk lives under, so
+    # editing a project_shared chunk gets the project_shared refusal
+    # rule even when the caller did not pass an explicit scope kwarg.
+    inferred_scope = meta.scope or "user"
+    guard = privacy.enforce_write_guard(
+        new_content,
+        surface="mem_edit",
+        force_unsafe=force_unsafe,
+        scope=inferred_scope,
+        audit_context={"chunk_id": chunk_id, "scope": inferred_scope},
+    )
+    if guard.decision == "blocked":
+        return (
+            f"Error: new_content matches {len(guard.hits)} privacy pattern(s); "
+            "edit rejected. Retry with force_unsafe=True to bypass (audit-logged)."
+        )
+    if guard.decision == "blocked_project_shared":
+        return (
+            f"Error: new_content matches {len(guard.hits)} privacy pattern(s) "
+            "and force_unsafe=True is not permitted on scope='project_shared' "
+            "chunks (git history is forever). Move the chunk to a different "
+            "scope first, or hand-edit the canonical file with explicit review."
+        )
     # Backup for rollback on indexing failure
     original = await asyncio.to_thread(meta.source_file.read_text, encoding="utf-8")
     try:
@@ -411,6 +463,8 @@ async def mem_batch_add(
     namespace: str | None = None,
     file: str | None = None,
     force_unsafe: bool = False,
+    scope: str = "user",
+    confirm_project_shared: bool = False,
     ctx: CtxType = None,
 ) -> str:
     """Add multiple memory entries in one call (KV batch).
@@ -420,11 +474,16 @@ async def mem_batch_add(
     and indexed once.
 
     Each entry's content passes through the same trust-boundary redaction
-    guard as ``mem_add``. If any entry matches a secret pattern, the whole
-    batch is rejected — partial-success on a flagged batch would leak the
-    transactional contract callers rely on. Pass ``force_unsafe=True`` to
-    bypass for the whole batch (each hit item is recorded with a
-    ``bypassed`` outcome label per audit).
+    guard as ``mem_add`` — routed through ``enforce_write_guard`` per
+    entry (ADR-0011 PR-D refactor of the earlier inline-scan path) so
+    the project_shared hard refusal is unbypassable on the batch path.
+    If any entry matches a secret pattern, the whole batch is rejected
+    — partial-success on a flagged batch would leak the transactional
+    contract callers rely on. Pass ``force_unsafe=True`` to bypass for
+    the whole batch (each hit item is recorded with a ``bypassed``
+    outcome label per audit). When ``scope='project_shared'``,
+    ``force_unsafe=True`` is hard-refused regardless: git history is
+    forever (ADR-0011 §5).
 
     Each entry's full value is scanned regardless of length — the scan
     no longer truncates at a fixed window, so a secret embedded past any
@@ -436,57 +495,93 @@ async def mem_batch_add(
         file: Target .md file.  If omitted, a timestamped file is created.
         force_unsafe: When True, bypass the redaction guard for any flagged
                       entries. Bypass events are recorded per item.
+        scope: ADR-0011 scope axis (``user`` / ``project_shared`` /
+               ``project_local``). Applies to every entry in the batch.
+        confirm_project_shared: Required when ``scope='project_shared'``
+                                — Gate B explicit opt-in for git-tracked writes.
     """
     if len(entries) > 500:
         return f"Error: batch too large (max 500 entries, got {len(entries)})."
 
-    # Trust-boundary redaction guard. Pre-scan every entry before any
-    # filesystem write so a flagged batch leaves no on-disk residue
-    # regardless of which entry tripped the pattern. See
-    # ``memtomem.privacy`` for the cross-repo sync rule.
+    # ADR-0011 Gate B (surface layer). Mirrors mem_add — explicit confirm
+    # required for any project_shared write, batch or single.
+    if scope == "project_shared" and not confirm_project_shared:
+        return (
+            "Error: scope='project_shared' writes to a git-tracked "
+            "directory. Pass confirm_project_shared=True to proceed."
+        )
+
+    # Trust-boundary redaction guard. Each entry routes through
+    # ``enforce_write_guard(record_outcome=False)`` so the
+    # project_shared force_unsafe hard refusal applies on the batch
+    # path too — the earlier inline ``privacy.scan`` + manual
+    # ``record`` pattern bypassed gate A and was the bypass route
+    # ADR-0011 §5 explicitly closes. We collect decisions first and
+    # only record outcomes after deciding whether to commit the
+    # whole batch (transactional invariant: no pass record on a
+    # rejected batch).
     from memtomem import privacy
 
-    # ``hit_counts[idx]`` records the actual ``len(privacy.scan(value))``
-    # for each entry that matched, so the bypass audit later carries the
-    # same hit count shape as the single-content guard
-    # (``enforce_write_guard`` reports ``len(hits)``). The earlier
-    # ``hit_indices.append(idx)`` form lost the count and forced
-    # ``hits=1`` on every batch audit line, breaking cross-surface
-    # audit fidelity (Codex review of PR #784, Minor #1).
-    hit_counts: dict[int, int] = {}
+    decisions: list[tuple[int, str, int]] = []  # (idx, decision, hit_count)
     for idx, entry in enumerate(entries):
         value = entry.get("value") or entry.get("content", "")
         if not value:
             continue
-        item_hits = privacy.scan(value)
-        if item_hits:
-            hit_counts[idx] = len(item_hits)
+        guard = privacy.enforce_write_guard(
+            value,
+            surface="mem_batch_add",
+            force_unsafe=force_unsafe,
+            scope=scope,
+            audit_context={
+                "namespace": namespace,
+                "file": file,
+                "item_idx": idx,
+                "scope": scope,
+            },
+            record_outcome=False,
+        )
+        decisions.append((idx, guard.decision, len(guard.hits)))
 
-    if hit_counts and not force_unsafe:
-        for _ in hit_counts:
-            privacy.record("blocked", "mem_batch_add")
+    blocked = [d for d in decisions if d[1] == "blocked"]
+    blocked_shared = [d for d in decisions if d[1] == "blocked_project_shared"]
+    if blocked_shared:
+        # Hard-refusal on project_shared force_unsafe — record blocked_project_shared
+        # for each hit item, no pass for clean items (transactional reject).
+        for _ in blocked_shared:
+            privacy.record("blocked_project_shared", "mem_batch_add")
+        idxs = [d[0] for d in blocked_shared]
         return (
-            f"Error: items at indices {sorted(hit_counts)} match privacy patterns; "
+            f"Error: items at indices {sorted(idxs)} match privacy patterns "
+            "and force_unsafe=True is not permitted on scope='project_shared' "
+            "(git history is forever). Whole batch rejected. Move flagged "
+            "items to scope='project_local' or scope='user' to bypass."
+        )
+    if blocked:
+        for _ in blocked:
+            privacy.record("blocked", "mem_batch_add")
+        idxs = [d[0] for d in blocked]
+        return (
+            f"Error: items at indices {sorted(idxs)} match privacy patterns; "
             "whole batch rejected. Resubmit with hit items removed, or pass "
             "force_unsafe=True to bypass (audit-logged)."
         )
 
-    for idx, entry in enumerate(entries):
-        value = entry.get("value") or entry.get("content", "")
-        if not value:
-            continue
-        if idx in hit_counts:
+    # Batch will commit — record per-entry outcomes and emit bypass
+    # audits for any force-unsafe hits.
+    for idx, decision, hit_count in decisions:
+        if decision == "bypassed":
             privacy.record("bypassed", "mem_batch_add")
-            # Funnel through the shared audit emitter so the
-            # ``namespace`` / ``file`` audit fields go through the same
-            # ``_sanitize_audit_value`` scrub the single-content guard
-            # uses. A secret-shaped batch ``file=`` argument used to
-            # leak verbatim here (Codex review of PR #784).
+            value = entries[idx].get("value") or entries[idx].get("content", "")
             privacy.emit_bypass_audit(
                 surface="mem_batch_add",
                 content_chars=len(value),
-                hits=hit_counts[idx],
-                audit_context={"namespace": namespace, "file": file, "item_idx": idx},
+                hits=hit_count,
+                audit_context={
+                    "namespace": namespace,
+                    "file": file,
+                    "item_idx": idx,
+                    "scope": scope,
+                },
             )
         else:
             privacy.record("pass", "mem_batch_add")

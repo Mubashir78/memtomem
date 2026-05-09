@@ -52,20 +52,58 @@ def _reset_counters():
 
 
 class TestMemEditRedactionGuard:
+    """ADR-0011 PR-D: the edit-surface guard runs **after** the chunk
+    lookup so the chunk's persisted ``metadata.scope`` can be fed in
+    (inferred-scope contract). A non-existent chunk_id therefore short-
+    circuits before the guard fires; tests provide a stub chunk via
+    monkeypatch so the guard is exercised in the normal flow.
+    """
+
+    @staticmethod
+    def _stub_user_chunk(monkeypatch, comp):
+        """Wire ``comp.storage.get_chunk`` to return a user-scope chunk
+        so the edit-surface guard runs with scope='user' (the default
+        path the existing tests cover)."""
+        from unittest.mock import AsyncMock
+
+        from memtomem.models import Chunk, ChunkMetadata
+
+        chunk = Chunk(
+            content="placeholder",
+            metadata=ChunkMetadata(
+                source_file=Path("/tmp/never_touched.md"),
+                scope="user",
+                start_line=1,
+                end_line=2,
+            ),
+            embedding=[0.1] * 1024,
+        )
+        monkeypatch.setattr(comp.storage, "get_chunk", AsyncMock(return_value=chunk))
+        # The downstream rollback path tries to read the source file;
+        # we only care about the guard's accounting, so stub the
+        # filesystem mutation + reindex to no-ops.
+
+        async def _noop_index_file(*args, **kwargs):
+            from memtomem.models import IndexingStats
+
+            return IndexingStats(0, 0, 0, 0, 0, 0.0)
+
+        monkeypatch.setattr(comp.index_engine, "index_file", _noop_index_file)
+
     @pytest.mark.asyncio
-    async def test_blocks_secret_and_records_blocked(self, bm25_only_components):
+    async def test_blocks_secret_and_records_blocked(self, bm25_only_components, monkeypatch):
         """Secret content rejected without ``force_unsafe``; counter
         increments under the ``mem_edit`` ``by_tool`` key (not
         ``mem_add``) so the guard's surface attribution stays observable.
         """
         comp, mem_dir = bm25_only_components
+        self._stub_user_chunk(monkeypatch, comp)
         app = AppContext.from_components(comp)
         ctx = StubCtx(app)
 
         before = privacy.snapshot()["by_tool"].get(
             "mem_edit", {"blocked": 0, "pass": 0, "bypassed": 0}
         )
-        # The guard runs before chunk lookup, so a fake UUID is fine.
         result = await mem_edit(  # type: ignore[arg-type]
             chunk_id=str(uuid4()),
             new_content=_SECRET_SAMPLE,
@@ -79,8 +117,11 @@ class TestMemEditRedactionGuard:
         assert after["blocked"] == before["blocked"] + 1
 
     @pytest.mark.asyncio
-    async def test_force_unsafe_records_bypassed(self, bm25_only_components, caplog):
+    async def test_force_unsafe_records_bypassed(
+        self, bm25_only_components, caplog, monkeypatch
+    ):
         comp, mem_dir = bm25_only_components
+        self._stub_user_chunk(monkeypatch, comp)
         app = AppContext.from_components(comp)
         ctx = StubCtx(app)
 
@@ -88,8 +129,6 @@ class TestMemEditRedactionGuard:
             "mem_edit", {"blocked": 0, "pass": 0, "bypassed": 0}
         )
         with caplog.at_level(logging.WARNING, logger="memtomem.privacy"):
-            # Storage lookup will return None; the bypass counter must
-            # have already incremented before that downstream miss.
             await mem_edit(  # type: ignore[arg-type]
                 chunk_id=str(uuid4()),
                 new_content=_SECRET_SAMPLE,
@@ -104,16 +143,15 @@ class TestMemEditRedactionGuard:
         assert "sk-" not in caplog.text
 
     @pytest.mark.asyncio
-    async def test_clean_content_records_pass(self, bm25_only_components):
+    async def test_clean_content_records_pass(self, bm25_only_components, monkeypatch):
         comp, mem_dir = bm25_only_components
+        self._stub_user_chunk(monkeypatch, comp)
         app = AppContext.from_components(comp)
         ctx = StubCtx(app)
 
         before = privacy.snapshot()["by_tool"].get(
             "mem_edit", {"blocked": 0, "pass": 0, "bypassed": 0}
         )
-        # Storage miss returns "chunk not found"; the guard's pass
-        # increment happens before that.
         await mem_edit(  # type: ignore[arg-type]
             chunk_id=str(uuid4()),
             new_content=_CLEAN_SAMPLE,
