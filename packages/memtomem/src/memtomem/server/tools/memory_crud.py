@@ -540,6 +540,22 @@ async def mem_delete(
         return f"Removed {deleted} chunks from index for {source_file}"
 
     if namespace:
+        # ADR-0011 PR-D Gate B on bulk namespace delete. project_shared
+        # memories can sit in the default namespace alongside user
+        # memories, so the namespace string alone does not imply the
+        # trust tier — probe the persisted scope set first.
+        ns_scopes = await app.storage.list_scopes_by_namespace(namespace)
+        if "project_shared" in ns_scopes and not confirm_project_shared:
+            logger.info(
+                "mem_delete rejected bulk project_shared namespace without confirmation",
+                extra={"namespace": namespace, "scopes": sorted(ns_scopes)},
+            )
+            return (
+                f"Error: namespace='{namespace}' delete would remove "
+                "scope='project_shared' chunks; pass confirm_project_shared=True "
+                "to proceed. Bulk namespace deletes are all-or-nothing; use "
+                "chunk_id for per-chunk control."
+            )
         deleted = await app.storage.delete_by_namespace(namespace)
         app.search_pipeline.invalidate_cache()
         return f"Removed {deleted} chunks from namespace '{namespace}'"

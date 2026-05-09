@@ -668,6 +668,22 @@ class SqliteBackend(
         ).fetchall()
         return {str(row[0] or "user") for row in rows}
 
+    async def list_scopes_by_namespace(self, namespace: str) -> set[str]:
+        """Return the distinct persisted scopes for chunks in ``namespace``.
+
+        ADR-0011 PR-D: ``mem_delete(namespace=...)`` uses this to refuse
+        bulk deletes that would remove ``project_shared`` chunks without
+        ``confirm_project_shared=True``. Project-shared memories can sit
+        in the same default namespace as user memories, so the
+        namespace string alone does not imply the trust tier.
+        """
+        db = self._get_read_db()
+        rows = db.execute(
+            "SELECT DISTINCT COALESCE(scope, 'user') FROM chunks WHERE namespace=?",
+            (namespace,),
+        ).fetchall()
+        return {str(row[0] or "user") for row in rows}
+
     async def update_chunks_scope_for_source(
         self,
         old_path: Path,

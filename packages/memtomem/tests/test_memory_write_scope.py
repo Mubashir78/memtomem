@@ -357,6 +357,68 @@ async def test_mem_add_file_path_in_project_dir_promotes_scope_and_blocks_force_
 
 
 @pytest.mark.asyncio
+async def test_mem_delete_by_namespace_with_project_shared_chunk_rejects_without_confirm(
+    bm25_only_components, tmp_path
+):
+    """PR-D review (round 3) pin: ``mem_delete(namespace=...)`` must
+    apply the same Gate B probe that ``source_file`` deletes do.
+
+    project_shared memories can sit in the same default namespace as
+    user memories, so passing ``namespace="default"`` could otherwise
+    wipe project_shared rows without ``confirm_project_shared=True``.
+    """
+    comp, _ = bm25_only_components
+    project_root = tmp_path / "proj_ns_delete"
+    proj_dir = project_root / ".memtomem" / "memories"
+    proj_dir.mkdir(parents=True)
+
+    # Stage one project_shared chunk and one user chunk, both in the
+    # default namespace.
+    proj_chunk = Chunk(
+        content="team rule body",
+        metadata=ChunkMetadata(
+            source_file=proj_dir / "rule.md",
+            scope="project_shared",
+            project_root=project_root,
+            namespace="default",
+        ),
+        embedding=[0.1] * 1024,
+    )
+    user_chunk = Chunk(
+        content="personal note body",
+        metadata=ChunkMetadata(
+            source_file=tmp_path / "u.md",
+            scope="user",
+            project_root=None,
+            namespace="default",
+        ),
+        embedding=[0.1] * 1024,
+    )
+    await comp.storage.upsert_chunks([proj_chunk, user_chunk])
+
+    app = AppContext.from_components(comp)
+    ctx = StubCtx(app)
+
+    out = await memory_crud.mem_delete(namespace="default", ctx=ctx)
+    assert "scope='project_shared'" in out
+    assert "confirm_project_shared=True" in out
+    # Both chunks must still be present — no partial mutation on a
+    # rejected bulk delete.
+    assert await comp.storage.get_chunk(proj_chunk.id) is not None
+    assert await comp.storage.get_chunk(user_chunk.id) is not None
+
+    # With explicit confirm, the bulk delete proceeds.
+    out_confirmed = await memory_crud.mem_delete(
+        namespace="default",
+        confirm_project_shared=True,
+        ctx=ctx,
+    )
+    assert "Removed" in out_confirmed
+    assert await comp.storage.get_chunk(proj_chunk.id) is None
+    assert await comp.storage.get_chunk(user_chunk.id) is None
+
+
+@pytest.mark.asyncio
 async def test_mem_batch_add_file_path_in_project_dir_promotes_scope(
     bm25_only_components, tmp_path
 ):
