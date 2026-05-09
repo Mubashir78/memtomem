@@ -1954,3 +1954,232 @@ def _is_within(path: Path, project_root: Path) -> bool:
         return path.resolve(strict=False).is_relative_to(project_root.resolve(strict=False))
     except (OSError, RuntimeError):
         return False
+
+
+@context.command("memory-migrate")
+@click.argument(
+    "source",
+    type=click.Path(exists=True, dir_okay=False, file_okay=True, path_type=Path),
+)
+@click.option(
+    "--from",
+    "from_scope",
+    type=click.Choice(list(get_args(TargetScope))),
+    required=True,
+    help="Source memory tier the file currently lives in.",
+)
+@click.option(
+    "--to",
+    "to_scope",
+    type=click.Choice(list(get_args(TargetScope))),
+    required=True,
+    help="Target memory tier the file moves into.",
+)
+@click.option(
+    "--apply",
+    "apply_",
+    is_flag=True,
+    default=False,
+    help="Execute the migration. Default is a dry-run preview.",
+)
+@click.option(
+    "--yes",
+    "-y",
+    "yes",
+    is_flag=True,
+    default=False,
+    help="Skip the project_shared confirmation prompt. Requires --apply.",
+)
+@click.option(
+    "--confirm-project-shared",
+    "confirm_project_shared",
+    is_flag=True,
+    default=False,
+    help="Confirm writing to the git-tracked project_shared memory tier.",
+)
+def memory_migrate_cmd(
+    source: Path,
+    from_scope: str,
+    to_scope: str,
+    apply_: bool,
+    yes: bool,
+    confirm_project_shared: bool,
+) -> None:
+    """Move a markdown memory file between ADR-0011 scope tiers.
+
+    v1: chunk-id-stable, single-DB rename. The source file moves on
+    disk to the target tier's canonical directory; the chunks table
+    is UPDATED in-place via ``update_chunks_scope_for_source`` so
+    chunk UUIDs and ``chunk_links`` lineage are preserved. No
+    re-index is triggered.
+
+    Default is dry-run; pass ``--apply`` to execute. When the target
+    is ``project_shared`` (git-tracked), the file content is re-scanned
+    by ``enforce_write_guard``; secret hits reject the migration with
+    no force bypass — git history would carry them forever (ADR-0011
+    §5).
+
+    On apply, the filesystem move precedes the DB UPDATE. If the
+    UPDATE fails, the move is reverted (best-effort) so the source
+    path remains canonical.
+
+    Cross-DB migration, glob/multi-file inputs, and partial chunk-link
+    lineage preservation are deferred to follow-up work.
+    """
+    if from_scope == to_scope:
+        raise click.ClickException("--from and --to must differ.")
+
+    source_resolved = source.expanduser().resolve()
+
+    import asyncio
+
+    asyncio.run(
+        _memory_migrate_run(
+            source_resolved,
+            from_scope,
+            to_scope,
+            apply_,
+            yes,
+            confirm_project_shared,
+        )
+    )
+
+
+async def _memory_migrate_run(
+    source: Path,
+    from_scope: str,
+    to_scope: str,
+    apply_: bool,
+    yes: bool,
+    confirm_project_shared: bool,
+) -> None:
+    import shutil
+
+    from memtomem import privacy
+    from memtomem.cli._bootstrap import cli_components
+    from memtomem.memory_scope import MemoryScopeError, resolve_memory_scope_dir
+
+    async with cli_components() as comp:
+        # Project-tier resolution. For ``from`` project tiers the source
+        # is expected at ``<root>/.memtomem/memories[.local]/<file>``;
+        # we lift project_root from the source path. For ``to`` project
+        # tiers without that anchor (e.g. user → project_shared), fall
+        # back to ``_find_project_root()`` walking from cwd.
+        project_root: Path | None = None
+        if from_scope != "user":
+            guessed = source.parent.parent.parent
+            if guessed.exists() and source.parent.parent.name == ".memtomem":
+                project_root = guessed
+        if project_root is None and to_scope != "user":
+            cwd_root = _find_project_root()
+            if (cwd_root / ".git").exists() or (cwd_root / "pyproject.toml").exists():
+                project_root = cwd_root
+            else:
+                raise click.ClickException(
+                    f"Cannot determine project_root for scope='{to_scope}'. "
+                    "Run from a project directory (with .git or pyproject.toml), "
+                    "or migrate from a project tier so the project root is "
+                    "inferred from the source path."
+                )
+
+        # Use the configured user-tier directory rather than the
+        # ``~/.memtomem/memories`` default — keeps CLI behaviour consistent
+        # with the active config (and lets tests isolate via ``memory_dirs``).
+        mdirs = comp.config.indexing.memory_dirs
+        user_base = Path(mdirs[0]) if mdirs else Path("~/.memtomem/memories")
+        try:
+            from_dir = resolve_memory_scope_dir(from_scope, project_root, user_base=user_base)
+            to_dir = resolve_memory_scope_dir(to_scope, project_root, user_base=user_base)
+        except MemoryScopeError as exc:
+            raise click.ClickException(str(exc)) from exc
+
+        try:
+            source.relative_to(from_dir)
+        except ValueError:
+            raise click.ClickException(
+                f"Source {source} is not under --from={from_scope} directory {from_dir}."
+            )
+
+        target = (to_dir / source.name).resolve()
+        if target.exists():
+            raise click.ClickException(
+                f"Target already exists: {target}. Move or rename it first."
+            )
+
+        affected = await comp.storage.count_chunks_by_source(source)
+
+        # Gate A on migrate: re-scan when landing in project_shared.
+        # Force bypass intentionally not allowed (ADR-0011 §5: git is
+        # forever). ``record_outcome=False`` on dry-run so the privacy
+        # counters reflect actual writes only.
+        if to_scope == "project_shared":
+            content = source.read_text(encoding="utf-8")
+            guard = privacy.enforce_write_guard(
+                content,
+                surface="memory_migrate",
+                force_unsafe=False,
+                scope=to_scope,
+                audit_context={"source": str(source), "target": str(target)},
+                record_outcome=apply_,
+            )
+            if guard.decision in ("blocked", "blocked_project_shared"):
+                click.secho(
+                    f"  ✗ Gate A: file content matches {len(guard.hits)} privacy "
+                    "pattern(s); migration to scope='project_shared' rejected. "
+                    "git history is forever — no force bypass available.",
+                    fg="red",
+                    err=True,
+                )
+                raise click.exceptions.Exit(1)
+
+        click.echo(f"Plan: migrate {source.name}")
+        click.echo(f"  from {from_scope}: {source}")
+        click.echo(f"  to   {to_scope}: {target}")
+        click.echo(f"  chunks affected: {affected}")
+        click.echo("  chunk_links lineage: 0 dropped (chunk-id-stable single-DB rename)")
+
+        if not apply_:
+            click.echo("\nRun with --apply to execute.")
+            return
+
+        if to_scope == "project_shared" and not (yes or confirm_project_shared):
+            if not click.confirm(
+                f"\nThis will write to the git-tracked tier {to_dir}. Continue?",
+                default=False,
+            ):
+                raise click.Abort()
+
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(source), str(target))
+        try:
+            updated = await comp.storage.update_chunks_scope_for_source(
+                source,
+                target,
+                to_scope,
+                project_root if to_scope != "user" else None,
+            )
+        except Exception as exc:
+            # Compensation: SQLite TX cannot roll back the FS move on
+            # its own. Revert the move (best-effort) so the source
+            # path remains canonical and the next attempt sees the
+            # pre-migration state.
+            try:
+                shutil.move(str(target), str(source))
+            except Exception:
+                click.secho(
+                    "  ✗ DB update failed AND filesystem rollback failed; "
+                    "source/target may diverge. Inspect both paths.",
+                    fg="red",
+                    err=True,
+                )
+                raise
+            raise click.ClickException(
+                f"DB update failed; filesystem move reverted: {exc}"
+            ) from exc
+
+        comp.search_pipeline.invalidate_cache()
+        click.secho(
+            f"  ✓ moved {source.name} → {to_scope} tier; "
+            f"{updated} chunk row(s) updated.",
+            fg="green",
+        )
