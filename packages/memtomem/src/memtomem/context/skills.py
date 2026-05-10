@@ -24,13 +24,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
 
-import click
-
-from memtomem import privacy
 from memtomem.context import _skip_reasons as skip_codes
 from memtomem.context import override as _override
 from memtomem.context._atomic import atomic_write_bytes, copy_tree_atomic
-from memtomem.context._gate_a import format_project_shared_block_message
+from memtomem.context._gate_a import GateABlocked, apply_gate_a
 from memtomem.config import TargetScope
 from memtomem.context._names import GENERATOR_VENDOR, InvalidNameError, validate_name
 from memtomem.context._runtime_targets import runtime_fanout_root
@@ -246,10 +243,12 @@ def generate_all_skills(
         for skill_dir in canonicals:
             dst = gen.target_dir(project_root, skill_dir.name)
             # ADR-0011 PR-E: target_dir may return None for scopes with no
-            # fan-out (default scope=project_shared never None here).
-            assert dst is not None, (
-                f"{target} target_dir returned None for default project_shared scope"
-            )
+            # fan-out (default scope=project_shared never None here). Raise
+            # explicitly so the contract survives `python -O`.
+            if dst is None:
+                raise RuntimeError(
+                    f"{target} target_dir returned None for default project_shared scope"
+                )
             copy_skill(skill_dir, dst)
             # ADR-0008 Invariant 4: per-vendor override replaces SKILL.md only.
             # Auxiliary files (scripts/, references/) stay from canonical.
@@ -300,6 +299,16 @@ def extract_skills_to_canonical(
     file aborts that skill's import without copying any of its files.
     ``project_shared`` destinations hard-abort via :class:`click.ClickException`
     on the first hit (with or without ``force_unsafe_import``).
+
+    Threat model — Gate A walks the source tree once and :func:`copy_skill`
+    re-reads the same files when the import proceeds; an adversarial
+    filesystem could swap bytes between the two reads (a TOCTOU window).
+    The current threat model is "accidental leak", not "adversarial
+    filesystem", so this gap is accepted: ``--force-unsafe-import`` is
+    not the path to bypass Gate A regardless, and ``project_shared``
+    hard-refuses without any bypass valve. Hardening to single-read +
+    in-memory copy is out of scope until a concrete adversarial-FS
+    threat appears.
 
     When ``only_name`` is set, every runtime entry with a different name is
     silently skipped before any validation/dedupe work.
@@ -356,10 +365,11 @@ def extract_skills_to_canonical(
 
             # Gate A — walk every file in the skill tree before copying.
             # One blocked file aborts the whole skill (atomic — never
-            # leave a partial copy in canonical).
-            blocked_file: Path | None = None
-            blocked_decision: str | None = None
-            blocked_hits: int = 0
+            # leave a partial copy in canonical). The project_shared
+            # hard-abort path raises ClickException inside apply_gate_a;
+            # the rglob loop only sees ``proceed=False`` for non-
+            # project_shared scopes.
+            blocked: tuple[Path, GateABlocked] | None = None
             for src_file in sorted(skill_dir.rglob("*")):
                 if not src_file.is_file():
                     continue
@@ -371,54 +381,33 @@ def extract_skills_to_canonical(
                     # it is real, otherwise the file passes through as
                     # a binary asset.
                     continue
-                guard = privacy.enforce_write_guard(
-                    content_text,
-                    surface="cli_context_init",
-                    force_unsafe=force_unsafe_import,
+                outcome = apply_gate_a(
+                    content_text=content_text,
+                    src=src_file,
                     scope=scope,
+                    force_unsafe_import=force_unsafe_import,
                     audit_context={
                         "source_file": str(src_file),
                         "skill_name": skill_name,
                         "kind": "skills",
                     },
-                    record_outcome=True,
+                    message_kind="skill",
+                    imported_so_far=len(imported),
                 )
-                if guard.decision in ("blocked", "blocked_project_shared"):
-                    blocked_file = src_file
-                    blocked_decision = guard.decision
-                    blocked_hits = len(guard.hits)
+                if isinstance(outcome, GateABlocked):
+                    blocked = (src_file, outcome)
                     break
-                if guard.decision not in ("pass", "bypassed"):
-                    raise RuntimeError(
-                        f"enforce_write_guard returned unexpected decision: {guard.decision!r}"
-                    )
 
-            if blocked_file is not None:
-                if scope == "project_shared":
-                    raise click.ClickException(
-                        format_project_shared_block_message(
-                            blocked_file,
-                            hits_count=blocked_hits,
-                            scope=scope,
-                            kind="skill",
-                            imported_so_far=len(imported),
-                        )
-                    )
-                code: skip_codes.SkipCode = (
-                    skip_codes.PRIVACY_BLOCKED_PROJECT_SHARED
-                    if blocked_decision == "blocked_project_shared"
-                    else skip_codes.PRIVACY_BLOCKED
-                )
-                hint = (
-                    " — pass --force-unsafe-import to bypass"
-                    if blocked_decision == "blocked"
-                    else ""
-                )
+            if blocked is not None:
+                blocked_file, blocked_outcome = blocked
                 skipped.append(
                     (
                         skill_name,
-                        f"blocked: {blocked_file.name} hit {blocked_hits} pattern(s){hint}",
-                        code,
+                        (
+                            f"blocked: {blocked_file.name} hit "
+                            f"{blocked_outcome.hits_count} pattern(s){blocked_outcome.hint}"
+                        ),
+                        blocked_outcome.code,
                     )
                 )
                 seen[skill_name] = runtime_label
@@ -488,7 +477,13 @@ def diff_skills(project_root: Path) -> list[tuple[str, str, str]]:
             else:
                 src = canonical_root / name
                 dst = gen.target_dir(project_root, name)
-                assert dst is not None  # ADR-0011 PR-E: default scope=project_shared never None
+                if dst is None:
+                    # ADR-0011 PR-E: default scope=project_shared never returns
+                    # None from the runtime table. `python -O` survives.
+                    raise RuntimeError(
+                        f"{gen_name} target_dir returned None — diff over default "
+                        f"project_shared scope should never see None per ADR-0011 PR-E"
+                    )
                 if _skill_dirs_equal(src, dst):
                     results.append((gen_name, name, "in sync"))
                 else:

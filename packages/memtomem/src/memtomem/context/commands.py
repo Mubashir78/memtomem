@@ -38,13 +38,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
 
-import click
-
-from memtomem import privacy
 from memtomem.context import _skip_reasons as skip_codes
 from memtomem.context import override as _override
 from memtomem.context._atomic import atomic_write_bytes, atomic_write_text
-from memtomem.context._gate_a import format_project_shared_block_message
+from memtomem.context._gate_a import GateABlocked, apply_gate_a
 from memtomem.config import TargetScope
 from memtomem.context._names import GENERATOR_VENDOR, InvalidNameError, Layout, validate_name
 from memtomem.context._runtime_targets import runtime_fanout_root
@@ -413,10 +410,12 @@ def generate_all_commands(
                     logger.warning("%s dropped %s from '%s'", target, dropped_fields, cmd.name)
             out_path = gen.target_file(project_root, cmd.name)
             # ADR-0011 PR-E: target_file may return None for scopes with no
-            # fan-out (default scope=project_shared never None here).
-            assert out_path is not None, (
-                f"{target} target_file returned None for default project_shared scope"
-            )
+            # fan-out (default scope=project_shared never None here). Raise
+            # explicitly so the contract survives `python -O`.
+            if out_path is None:
+                raise RuntimeError(
+                    f"{target} target_file returned None for default project_shared scope"
+                )
             atomic_write_text(out_path, content)
             # ADR-0008 Invariant 4: per-vendor override replaces the runtime file.
             # Race: see PR-D' for the unified write path that closes the
@@ -482,72 +481,6 @@ def _resolve_command_extract_target(canonical_root: Path, cmd_name: str) -> tupl
     if has_flat:
         return flat_target, "flat"
     return dir_target, "dir"
-
-
-def _apply_command_gate_a(
-    *,
-    content_text: str,
-    src: Path,
-    dst: Path,
-    cmd_name: str,
-    scope: TargetScope,
-    runtime: str,
-    force_unsafe_import: bool,
-    imported_so_far: int,
-    skipped: list[tuple[str, str, skip_codes.SkipCode]],
-) -> bool:
-    """Apply Gate A to one command file's scanned content.
-
-    Returns ``True`` when the caller should proceed with the write,
-    ``False`` when the file was rejected and recorded into ``skipped``
-    (or, for ``project_shared`` destinations, raised as
-    :class:`click.ClickException`).
-    """
-    guard = privacy.enforce_write_guard(
-        content_text,
-        surface="cli_context_init",
-        force_unsafe=force_unsafe_import,
-        scope=scope,
-        # Mirror agents.py audit_context shape — SOC pipelines grep both
-        # ``source=`` and ``target=`` for incident triage; commands' earlier
-        # omission was a sibling-parity gap (PR #889 review D1).
-        audit_context={
-            "source": str(src),
-            "target": str(dst),
-            "kind": "commands",
-            "runtime": runtime,
-            "command_name": cmd_name,
-        },
-        record_outcome=True,
-    )
-    if guard.decision in ("blocked", "blocked_project_shared"):
-        if scope == "project_shared":
-            raise click.ClickException(
-                format_project_shared_block_message(
-                    src,
-                    hits_count=len(guard.hits),
-                    scope=scope,
-                    kind="command",
-                    imported_so_far=imported_so_far,
-                )
-            )
-        code: skip_codes.SkipCode = (
-            skip_codes.PRIVACY_BLOCKED_PROJECT_SHARED
-            if guard.decision == "blocked_project_shared"
-            else skip_codes.PRIVACY_BLOCKED
-        )
-        hint = " — pass --force-unsafe-import to bypass" if guard.decision == "blocked" else ""
-        skipped.append(
-            (
-                cmd_name,
-                f"blocked: {len(guard.hits)} privacy pattern hit(s){hint}",
-                code,
-            )
-        )
-        return False
-    if guard.decision not in ("pass", "bypassed"):
-        raise RuntimeError(f"enforce_write_guard returned unexpected decision: {guard.decision!r}")
-    return True
 
 
 def extract_commands_to_canonical(
@@ -642,17 +575,33 @@ def extract_commands_to_canonical(
                 skipped.append((cmd_name, f"unreadable: {exc}", skip_codes.PARSE_ERROR))
                 continue
             content_text = content_bytes.decode("utf-8", errors="replace")
-            if not _apply_command_gate_a(
+            outcome = apply_gate_a(
                 content_text=content_text,
                 src=md_file,
-                dst=dst,
-                cmd_name=cmd_name,
                 scope=scope,
-                runtime="claude",
                 force_unsafe_import=force_unsafe_import,
+                # Mirror agents.py audit_context shape — SOC pipelines grep
+                # both ``source=`` and ``target=`` for incident triage;
+                # commands' earlier omission was a sibling-parity gap
+                # (PR #889 review D1).
+                audit_context={
+                    "source": str(md_file),
+                    "target": str(dst),
+                    "kind": "commands",
+                    "runtime": "claude",
+                    "command_name": cmd_name,
+                },
+                message_kind="command",
                 imported_so_far=len(imported),
-                skipped=skipped,
-            ):
+            )
+            if isinstance(outcome, GateABlocked):
+                skipped.append(
+                    (
+                        cmd_name,
+                        f"blocked: {outcome.hits_count} privacy pattern hit(s){outcome.hint}",
+                        outcome.code,
+                    )
+                )
                 seen[cmd_name] = claude_label
                 continue
             dst.parent.mkdir(parents=True, exist_ok=True)
@@ -698,17 +647,29 @@ def extract_commands_to_canonical(
             # Scan the CONVERTED Markdown — that's what gets persisted.
             # A secret in the source `prompt = "..."` field flows into
             # the body, so this catches it without re-scanning the raw TOML.
-            if not _apply_command_gate_a(
+            outcome = apply_gate_a(
                 content_text=canonical_content,
                 src=toml_file,
-                dst=dst,
-                cmd_name=cmd_name,
                 scope=scope,
-                runtime="gemini",
                 force_unsafe_import=force_unsafe_import,
+                audit_context={
+                    "source": str(toml_file),
+                    "target": str(dst),
+                    "kind": "commands",
+                    "runtime": "gemini",
+                    "command_name": cmd_name,
+                },
+                message_kind="command",
                 imported_so_far=len(imported),
-                skipped=skipped,
-            ):
+            )
+            if isinstance(outcome, GateABlocked):
+                skipped.append(
+                    (
+                        cmd_name,
+                        f"blocked: {outcome.hits_count} privacy pattern hit(s){outcome.hint}",
+                        outcome.code,
+                    )
+                )
                 seen[cmd_name] = gemini_label
                 continue
             dst.parent.mkdir(parents=True, exist_ok=True)
@@ -771,7 +732,13 @@ def diff_commands(project_root: Path) -> list[tuple[str, str, str]]:
                 continue
             expected, _ = gen.render(cmd)
             target = gen.target_file(project_root, name)
-            assert target is not None  # ADR-0011 PR-E: default scope=project_shared never None
+            if target is None:
+                # ADR-0011 PR-E: default scope=project_shared never returns
+                # None from the runtime table. `python -O` survives.
+                raise RuntimeError(
+                    f"{gen_name} target_file returned None — diff over default "
+                    f"project_shared scope should never see None per ADR-0011 PR-E"
+                )
             actual = target.read_text(encoding="utf-8") if target.is_file() else ""
             if expected.strip() == actual.strip():
                 results.append((gen_name, name, "in sync"))

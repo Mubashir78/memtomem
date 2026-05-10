@@ -529,6 +529,55 @@ def test_extract_skills_per_file_walk_blocks_scripts_dir(
     assert not (home / ".memtomem" / "skills" / "myskill").exists()
 
 
+def test_extract_skills_project_shared_blocked_hard_aborts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Skills #2 — project_shared destination + blocked → ClickException.
+
+    PR-E follow-up D2 part 2 — skills.py refactor moved Gate A through
+    apply_gate_a; the rglob loop now never observes a project_shared
+    block (the helper raises before returning). This test pins the
+    contract for the skills kind so the atomic-skill semantic is
+    preserved across the refactor.
+    """
+    home = tmp_path / "home"
+    set_home(monkeypatch, str(home))
+    proj = _make_project(tmp_path)
+
+    skill = proj / ".claude" / "skills" / "myskill"
+    (skill / "scripts").mkdir(parents=True)
+    (skill / "SKILL.md").write_text("---\nname: myskill\n---\nclean body\n", encoding="utf-8")
+    (skill / "scripts" / "leak.py").write_text(f"# uses {_AKIA_SECRET}\n", encoding="utf-8")
+
+    with pytest.raises(click.ClickException) as exc_info:
+        extract_skills_to_canonical(proj, scope="project_shared")
+    msg = exc_info.value.message
+    assert "Gate A" in msg
+    assert "project_shared" in msg
+    # No partial copy — even SKILL.md must NOT exist in canonical.
+    assert not (proj / ".memtomem" / "skills" / "myskill").exists()
+
+
+def test_extract_skills_project_shared_force_unsafe_still_aborts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Skills B-spec smoke #16 — --force-unsafe-import does NOT bypass project_shared."""
+    home = tmp_path / "home"
+    set_home(monkeypatch, str(home))
+    proj = _make_project(tmp_path)
+
+    skill = proj / ".claude" / "skills" / "myskill"
+    (skill / "scripts").mkdir(parents=True)
+    (skill / "SKILL.md").write_text("---\nname: myskill\n---\nclean body\n", encoding="utf-8")
+    (skill / "scripts" / "leak.py").write_text(f"# uses {_AKIA_SECRET}\n", encoding="utf-8")
+
+    with pytest.raises(click.ClickException) as exc_info:
+        extract_skills_to_canonical(proj, scope="project_shared", force_unsafe_import=True)
+    assert "no force bypass" in exc_info.value.message.lower()
+
+
 def test_extract_skills_clean_skill_copies_normally(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -572,6 +621,55 @@ def test_extract_commands_gemini_toml_secret_in_prompt_blocked(
     assert result.imported == []
     codes = [code for _, _, code in result.skipped]
     assert skip_codes.PRIVACY_BLOCKED in codes
+
+
+def test_extract_commands_project_shared_blocked_hard_aborts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Commands #2 — project_shared destination + blocked → ClickException.
+
+    Mirrors the agents counterpart at the top of this file. PR-E follow-up
+    D2 — apply_gate_a centralised the hard-abort path; this test pins the
+    contract for the commands kind so a future helper drift cannot silently
+    let a project_shared command write through.
+    """
+    home = tmp_path / "home"
+    set_home(monkeypatch, str(home))
+    proj = _make_project(tmp_path)
+
+    runtime = proj / ".claude" / "commands"
+    runtime.mkdir(parents=True)
+    (runtime / "leak.md").write_text(
+        f"---\nname: leak\n---\nuses {_AKIA_SECRET}\n", encoding="utf-8"
+    )
+
+    with pytest.raises(click.ClickException) as exc_info:
+        extract_commands_to_canonical(proj, scope="project_shared")
+    msg = exc_info.value.message
+    assert "Gate A" in msg
+    assert "project_shared" in msg
+    assert not (proj / ".memtomem" / "commands" / "leak.md").exists()
+
+
+def test_extract_commands_project_shared_force_unsafe_still_aborts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Commands B-spec smoke #16 — --force-unsafe-import does NOT bypass project_shared."""
+    home = tmp_path / "home"
+    set_home(monkeypatch, str(home))
+    proj = _make_project(tmp_path)
+
+    runtime = proj / ".claude" / "commands"
+    runtime.mkdir(parents=True)
+    (runtime / "leak.md").write_text(
+        f"---\nname: leak\n---\nuses {_AKIA_SECRET}\n", encoding="utf-8"
+    )
+
+    with pytest.raises(click.ClickException) as exc_info:
+        extract_commands_to_canonical(proj, scope="project_shared", force_unsafe_import=True)
+    assert "no force bypass" in exc_info.value.message.lower()
 
 
 def test_extract_commands_codex_not_imported(
@@ -634,6 +732,104 @@ def test_unknown_decision_raises_runtime_error(
     def fake_guard(*a: Any, **kw: Any) -> WriteGuardResult:
         return WriteGuardResult("nonsense", [])
 
-    monkeypatch.setattr("memtomem.context.agents.privacy.enforce_write_guard", fake_guard)
+    # Gate A apply lives in _gate_a now (PR-E follow-up D2 — apply_gate_a
+    # helper). The chokepoint stayed privacy.enforce_write_guard; only
+    # the call site moved.
+    monkeypatch.setattr("memtomem.context._gate_a.privacy.enforce_write_guard", fake_guard)
     with pytest.raises(RuntimeError, match="unexpected decision"):
         extract_agents_to_canonical(proj, scope="user")
+
+
+# ── D2 — audit_context shape pins (PR-E follow-up) ─────────────────────
+
+
+def _capture_guard_audit(monkeypatch: pytest.MonkeyPatch) -> dict[str, dict[str, object]]:
+    """Spy ``privacy.enforce_write_guard`` and capture the first call's audit_context.
+
+    Returns a dict the caller can read after the extract function returns.
+    The spy still has to return a real ``WriteGuardResult`` so the extract
+    pipeline proceeds normally — we want the audit-context capture, not
+    the proceed/block decision.
+
+    Spy signature mirrors the chokepoint (``dict[str, object]``) so a
+    future producer that legitimately routes a non-string field (e.g.
+    an ``item_idx: int`` from a batch ingress surface) flows through
+    this spy without a type mismatch. Current producers all pass
+    string-only values; the assertions still pin those shapes.
+    """
+    captured: dict[str, dict[str, object]] = {}
+
+    def spy(content_text: str, *, audit_context: dict[str, object], **kw: Any) -> WriteGuardResult:
+        if "first" not in captured:
+            captured["first"] = dict(audit_context)
+        return WriteGuardResult("pass", [])
+
+    # All three kinds (agents / skills / commands) now route through
+    # _gate_a.apply_gate_a, which dereferences ``privacy.enforce_write_guard``
+    # at call time — patching the helper module's namespace catches every
+    # caller.
+    monkeypatch.setattr("memtomem.context._gate_a.privacy.enforce_write_guard", spy)
+    return captured
+
+
+def test_extract_agents_audit_context_shape(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """D2 — agents audit_context keeps {source, target, kind, agent_name}.
+
+    PR #889 review carry-over D1 was a sibling-parity gap on the
+    commands' audit_context — the source/target/runtime fields were
+    missing. Pinning the per-kind shape prevents a future "let's
+    normalise audit_context" refactor from silently breaking
+    SOC-pipeline grep on per-kind fields.
+    """
+    home = tmp_path / "home"
+    set_home(monkeypatch, str(home))
+    proj = _make_project(tmp_path)
+    _seed_user_runtime_agents(home, "agt", "---\nname: agt\n---\nbody\n")
+
+    captured = _capture_guard_audit(monkeypatch)
+    extract_agents_to_canonical(proj, scope="user")
+    assert captured["first"].keys() == {"source", "target", "kind", "agent_name"}
+    assert captured["first"]["kind"] == "agents"  # plural, intentionally
+    assert captured["first"]["agent_name"] == "agt"
+
+
+def test_extract_skills_audit_context_shape(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """D2 — skills audit_context keeps {source_file, skill_name, kind}."""
+    home = tmp_path / "home"
+    set_home(monkeypatch, str(home))
+    proj = _make_project(tmp_path)
+    skill = home / ".claude" / "skills" / "myskill"
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text("---\nname: myskill\n---\nbody\n", encoding="utf-8")
+
+    captured = _capture_guard_audit(monkeypatch)
+    extract_skills_to_canonical(proj, scope="user")
+    assert captured["first"].keys() == {"source_file", "skill_name", "kind"}
+    assert captured["first"]["kind"] == "skills"  # plural
+    assert captured["first"]["skill_name"] == "myskill"
+
+
+def test_extract_commands_audit_context_shape(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """D2 — commands audit_context keeps {source, target, kind, runtime, command_name}."""
+    home = tmp_path / "home"
+    set_home(monkeypatch, str(home))
+    proj = _make_project(tmp_path)
+    runtime = home / ".claude" / "commands"
+    runtime.mkdir(parents=True)
+    (runtime / "cmd.md").write_text("---\nname: cmd\n---\nbody\n", encoding="utf-8")
+
+    captured = _capture_guard_audit(monkeypatch)
+    extract_commands_to_canonical(proj, scope="user")
+    assert captured["first"].keys() == {"source", "target", "kind", "runtime", "command_name"}
+    assert captured["first"]["kind"] == "commands"  # plural
+    assert captured["first"]["runtime"] == "claude"
+    assert captured["first"]["command_name"] == "cmd"
