@@ -52,6 +52,35 @@ function _groupNamespaces(namespaces) {
   return { groups, ungrouped };
 }
 
+function _namespaceDropdownGroupName(nsName) {
+  if (nsName === 'default') return 'Default';
+  if (nsName.startsWith('claude-memory:') || nsName.startsWith('claude:')) return 'Claude';
+  if (nsName.startsWith('codex:') || nsName.startsWith('openai:')) return 'OpenAI';
+  if (nsName.startsWith('agent-runtime:')) return 'Agents';
+  if (nsName.includes(':')) return 'Scoped';
+  return 'User';
+}
+
+function _namespaceDropdownBuckets(namespaces) {
+  const sorted = [...namespaces].sort((a, b) => (
+    (a.namespace === 'default' ? -1 : b.namespace === 'default' ? 1 : 0)
+    || b.chunk_count - a.chunk_count
+    || a.namespace.localeCompare(b.namespace)
+  ));
+  const buckets = new Map();
+  sorted.forEach(ns => {
+    const group = _namespaceDropdownGroupName(ns.namespace);
+    if (!buckets.has(group)) buckets.set(group, []);
+    buckets.get(group).push(ns);
+  });
+  const preferred = ['Default', 'User', 'Claude', 'OpenAI', 'Agents', 'Scoped'];
+  const names = [
+    ...preferred.filter(name => buckets.has(name)),
+    ...[...buckets.keys()].filter(name => !preferred.includes(name)).sort(),
+  ];
+  return names.map(name => ({ name, members: buckets.get(name) || [] }));
+}
+
 // ---------------------------------------------------------------------------
 // Namespace filter dropdowns + Namespaces tab
 // ---------------------------------------------------------------------------
@@ -63,30 +92,33 @@ async function loadNamespaceDropdowns() {
   try {
     const data = await api('GET', '/api/namespaces');
     const namespaces = data.namespaces || [];
-    const { groups, ungrouped } = _groupNamespaces(namespaces);
+    const buckets = _namespaceDropdownBuckets(namespaces);
     ['ns-filter', 'tl-namespace', 'exp-namespace'].forEach(id => {
       const sel = document.getElementById(id);
       if (!sel) return;
       const current = sel.value;
       // Keep first option (All Namespaces), remove rest + optgroups
       while (sel.children.length > 1) sel.removeChild(sel.lastChild);
-      groups.forEach(g => {
+      buckets.forEach(bucket => {
+        if (bucket.name === 'Default') {
+          bucket.members.forEach(ns => {
+            const opt = document.createElement('option');
+            opt.value = ns.namespace;
+            opt.textContent = `${ns.namespace} (${ns.chunk_count})`;
+            sel.appendChild(opt);
+          });
+          return;
+        }
         const optgroup = document.createElement('optgroup');
-        optgroup.label = `${g.prefix} (${g.totalChunks} chunks)`;
-        g.members.forEach(ns => {
+        const totalChunks = bucket.members.reduce((s, ns) => s + ns.chunk_count, 0);
+        optgroup.label = `${bucket.name} (${totalChunks})`;
+        bucket.members.forEach(ns => {
           const opt = document.createElement('option');
           opt.value = ns.namespace;
-          const suffix = ns.namespace.slice(g.prefix.length + 1);
-          opt.textContent = `${suffix} (${ns.chunk_count})`;
+          opt.textContent = `${ns.namespace} (${ns.chunk_count})`;
           optgroup.appendChild(opt);
         });
         sel.appendChild(optgroup);
-      });
-      ungrouped.forEach(ns => {
-        const opt = document.createElement('option');
-        opt.value = ns.namespace;
-        opt.textContent = `${ns.namespace} (${ns.chunk_count})`;
-        sel.appendChild(opt);
       });
       if (current) {
         sel.value = current;
@@ -786,4 +818,3 @@ document.addEventListener('keydown', e => {
 // ═══════════════════════════════════════════════════════════════════════════
 
 // Treemap is now rendered inline in loadDashboard() — no monkey-patch needed.
-
