@@ -379,7 +379,12 @@ def _isolate_runtime(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
     runtime_base.mkdir(mode=0o700)
     runtime_base.chmod(0o700)
     monkeypatch.setenv("XDG_RUNTIME_DIR", str(runtime_base))
-    return runtime_base / "memtomem"
+    target = runtime_base / "memtomem"
+    # On Windows, runtime_dir() skips XDG_RUNTIME_DIR (POSIX/systemd convention)
+    # and resolves to tempfile.gettempdir() / f"memtomem-{uid}". Patch the
+    # resolver itself so isolation works on every OS.
+    monkeypatch.setattr("memtomem._runtime_paths.runtime_dir", lambda: target)
+    return target
 
 
 def test_liveness_parses_web_pid_payload() -> None:
