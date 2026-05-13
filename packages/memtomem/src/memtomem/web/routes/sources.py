@@ -19,6 +19,7 @@ from memtomem.web.schemas.sources import (
     LanguageDriftInfo,
     RegenerateStartResponse,
     RegenerateStatusResponse,
+    SourceContentMatchesResponse,
     SourceOut,
     SourcesResponse,
 )
@@ -252,6 +253,63 @@ async def list_sources(
         limit=limit,
         language_drift=drift_info,
     )
+
+
+@router.get("/content-matches", response_model=SourceContentMatchesResponse)
+async def source_content_matches(
+    q: str = Query(
+        ...,
+        min_length=1,
+        max_length=500,
+        description="Plain text to match in indexed chunk content",
+    ),
+    limit: int = Query(10000, ge=1, le=10000),
+    target_scope: TargetScope | None = Query(
+        None,
+        description=(
+            "Apply the same canonical-residency tier visibility as GET "
+            "/api/sources. Omitted hides project_local; passing a scope narrows "
+            "to exactly that tier."
+        ),
+    ),
+    storage=Depends(get_storage),
+    config=Depends(get_config),
+) -> SourceContentMatchesResponse:
+    """Return source paths whose indexed text contains ``q``.
+
+    This powers the Sources tab's lightweight body-aware filter. It uses
+    indexed chunk text and cached source summaries, not raw file reads, so
+    deleted/unavailable files still match as long as their chunks remain in
+    storage.
+    """
+    query = q.strip()
+    if not query:
+        raise HTTPException(status_code=400, detail="Query must not be blank.")
+
+    pmdirs = config.indexing.project_memory_dirs
+
+    def _visible_for_scope(path: Path | str) -> bool:
+        source_scope, _project_root = classify_scope(path, pmdirs)
+        if target_scope is None:
+            return source_scope != "project_local"
+        return source_scope == target_scope
+
+    paths: list[Path] = []
+    for candidate in await storage.search_source_files_by_content(query, limit=10000):
+        if len(paths) >= limit:
+            break
+        if _visible_for_scope(candidate):
+            paths.append(candidate)
+    seen = {str(p) for p in paths}
+    needle = query.casefold()
+    for path, record in (await storage.get_all_ai_summaries()).items():
+        if len(paths) >= limit:
+            break
+        summary = (record or {}).get("summary") or ""
+        if path not in seen and needle in summary.casefold() and _visible_for_scope(path):
+            paths.append(Path(path))
+            seen.add(path)
+    return SourceContentMatchesResponse(query=query, paths=[str(p) for p in paths])
 
 
 @router.delete("", response_model=DeleteResponse)
