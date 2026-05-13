@@ -2489,7 +2489,13 @@ select:focus-visible {
 .home-search-wrap input { flex: 1; min-width: 0; }
 
 /* A. Stats Row */
-.home-stats-row { display: grid; grid-template-columns: repeat(6, 1fr); gap: 12px; }
+.home-stats-row {
+  --home-stat-cols: 4;
+  display: grid;
+  grid-template-columns: repeat(var(--home-stat-cols), minmax(0, 1fr));
+  gap: 12px;
+}
+body.dev-mode .home-stats-row { --home-stat-cols: 6; }
 .home-stats-row .stat-card { min-width: 0; }
 
 .home-section-title {
@@ -2606,12 +2612,14 @@ select:focus-visible {
 
 /* ── Sprint 3: Responsive Breakpoints ── */
 @media (max-width: 960px) {
-  .home-stats-row { grid-template-columns: repeat(3, 1fr); }
+  .home-stats-row { --home-stat-cols: 2; }
+  body.dev-mode .home-stats-row { --home-stat-cols: 3; }
   .home-activity-row { grid-template-columns: 1fr 1fr; }
 }
 @media (max-width: 768px) {
   /* Home tab responsive */
-  .home-stats-row { grid-template-columns: repeat(2, 1fr); }
+  .home-stats-row,
+  body.dev-mode .home-stats-row { --home-stat-cols: 1; }
   .home-activity-row { grid-template-columns: 1fr; }
   .home-bottom-row { grid-template-columns: 1fr; }
 
@@ -2704,10 +2712,6 @@ select:focus-visible {
   .home-search-wrap,
   .home-search-wrap input {
     min-width: 0;
-  }
-
-  .home-stats-row {
-    grid-template-columns: 1fr;
   }
 
   .home-bar-label {

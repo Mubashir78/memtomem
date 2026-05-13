@@ -326,6 +326,37 @@ def test_html_settings_nav_btns_all_carry_ui_tier_attr() -> None:
         assert "data-ui-tier=" in tag, f"settings-nav-btn missing data-ui-tier: {tag[:120]}"
 
 
+def test_home_harness_stat_cards_are_dev_tier() -> None:
+    """Sessions and Working Memory depend on dev-only routers.
+
+    The JS already gates their API fetches, but the cards themselves must
+    carry the same tier marker so prod mode hides the empty counters.
+    """
+    html = _read_static("index.html")
+    for element_id in ("home-sessions", "home-scratch"):
+        match = re.search(
+            rf'<div[^>]*class="stat-card card"[^>]*>[\s\S]*?id="{element_id}"',
+            html,
+        )
+        assert match is not None, f"{element_id} stat card missing from Home markup"
+        assert 'data-ui-tier="dev"' in match.group(0), (
+            f"{element_id} stat card must be dev-tier so prod hides it"
+        )
+
+
+def test_home_stat_grid_sizes_match_ui_mode() -> None:
+    """Home stat cards are 4-up in prod and 6-up in dev."""
+    css = _read_static("style.css")
+    assert "--home-stat-cols: 4" in css, "prod Home stat grid must default to 4 columns"
+    assert re.search(
+        r"body\.dev-mode\s+\.home-stats-row\s*\{\s*--home-stat-cols:\s*6;",
+        css,
+    ), "dev Home stat grid must expand to 6 columns"
+    assert "repeat(var(--home-stat-cols), minmax(0, 1fr))" in css, (
+        "Home stat grid must size from the ui-mode column variable"
+    )
+
+
 def test_ctx_overview_has_landing_modifier_for_group_dashboard() -> None:
     """ctx-overview is the Agent Integrations group's dashboard card and must
     carry the ``settings-nav-btn--landing`` modifier so CSS gives it visual
