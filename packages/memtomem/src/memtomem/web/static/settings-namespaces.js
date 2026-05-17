@@ -755,11 +755,29 @@ qs('cmd-palette').addEventListener('click', e => {
 // Extend existing keydown handler — we add a new listener that fires before
 // We need to intercept certain keys
 document.addEventListener('keydown', e => {
-  // Cmd+K / Ctrl+K: Command Palette
+  // A11Y-3.1: when any modal-overlay is on screen the only global shortcut
+  // that fires from this listener is Cmd+K-as-close — and only when the
+  // command palette itself owns the top of the stack. Everything else
+  // (Cmd+K open, tab numbers 1–7, Enter, Backspace, g-then-_) defers to
+  // the modal's own key handlers so a stray hotkey can't pop a second
+  // overlay on top of an already-open one. Esc lives in app.js / the
+  // cmd-palette's own listener — never gated here.
+  if (window.isAnyModalOpen()) {
+    // Cmd/Ctrl+K is a modifier shortcut some browsers map to address-bar
+    // focus; always swallow it while a modal is up so the default can't
+    // escape the focus trap. When the palette owns the top, also toggle
+    // it closed — preserves the bare-key dismissal that opened it.
+    if ((e.metaKey || e.ctrlKey) && e.key === 'k') {
+      e.preventDefault();
+      if (window.isTopModal(qs('cmd-palette'))) _closeCmdPalette();
+    }
+    return;
+  }
+
+  // Cmd+K / Ctrl+K: Command Palette (close-while-open is handled above)
   if ((e.metaKey || e.ctrlKey) && e.key === 'k') {
     e.preventDefault();
-    if (STATE.cmdPaletteOpen) _closeCmdPalette();
-    else _openCmdPalette();
+    _openCmdPalette();
     return;
   }
 
