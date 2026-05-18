@@ -14,6 +14,7 @@ import pytest
 
 _STATIC_DIR = Path(__file__).resolve().parents[1] / "src" / "memtomem" / "web" / "static"
 _APP_JS = _STATIC_DIR / "app.js"
+_INDEX_HTML = _STATIC_DIR / "index.html"
 _TIMELINE_JS = _STATIC_DIR / "timeline.js"
 
 
@@ -21,6 +22,12 @@ _TIMELINE_JS = _STATIC_DIR / "timeline.js"
 def app_js() -> str:
     assert _APP_JS.exists(), f"app.js missing: {_APP_JS}"
     return _APP_JS.read_text(encoding="utf-8")
+
+
+@pytest.fixture(scope="module")
+def index_html() -> str:
+    assert _INDEX_HTML.exists(), f"index.html missing: {_INDEX_HTML}"
+    return _INDEX_HTML.read_text(encoding="utf-8")
 
 
 @pytest.fixture(scope="module")
@@ -66,6 +73,66 @@ class TestSearchResultItemA11y:
         assert "setAttribute('aria-label'" in body, (
             "result-item must set aria-label from filename/lines/namespace/age "
             "so screen readers announce a meaningful name"
+        )
+
+
+class TestIssue1062IconButtonNames:
+    """Pin source-level labels for icon-only controls checked by issue #1062."""
+
+    def test_modal_close_buttons_have_accessible_names(self, index_html: str) -> None:
+        for button_id in (
+            "expand-close-btn",
+            "source-preview-close",
+            "settings-close-btn",
+            "shortcuts-close-btn",
+        ):
+            m = re.search(rf'<button\b[^>]*\bid="{re.escape(button_id)}"[^>]*>', index_html)
+            assert m, f"#{button_id} button not found"
+            tag = m.group(0)
+            assert "data-i18n-aria-label=" in tag and "aria-label=" in tag, (
+                f"#{button_id} is icon-only and must expose a translated "
+                "accessible name instead of relying on the × glyph"
+            )
+
+    def test_view_toggle_updates_runtime_aria_label(self, app_js: str) -> None:
+        # Bound by intrinsic anchors (the state flip line and the renderResults
+        # tail call) rather than a // --- comment delimiter, so a reflow of the
+        # surrounding section header doesn't break the test in a confusing way.
+        listener_start = app_js.index("qs('view-toggle').addEventListener")
+        listener_end = app_js.index("renderResults(STATE.lastResults);", listener_start) + len(
+            "renderResults(STATE.lastResults);"
+        )
+        block = app_js[listener_start:listener_end]
+        assert "_syncViewToggle()" in block, (
+            "view-toggle click handler must delegate to _syncViewToggle so the "
+            "same label logic runs on click and on langchange"
+        )
+
+    def test_view_toggle_label_survives_langchange(self, app_js: str, index_html: str) -> None:
+        # Regression pin: a previous iteration left data-i18n-title /
+        # data-i18n-aria-label on #view-toggle. I18N.applyDOM() (invoked on
+        # every langchange) then reset both attributes to the generic
+        # search.view_title string, silently undoing the per-state runtime
+        # label written by the click handler. JS now owns these attributes,
+        # so the HTML element must NOT carry the i18n hooks, and a langchange
+        # listener must call the shared sync helper.
+        m = re.search(r'<button\b[^>]*\bid="view-toggle"[^>]*>', index_html)
+        assert m, "#view-toggle button not found"
+        tag = m.group(0)
+        assert "data-i18n-title" not in tag, (
+            "#view-toggle must not declare data-i18n-title — applyDOM() would "
+            "clobber the state-dependent label written by _syncViewToggle()"
+        )
+        assert "data-i18n-aria-label" not in tag, (
+            "#view-toggle must not declare data-i18n-aria-label — applyDOM() "
+            "would clobber the state-dependent label written by _syncViewToggle()"
+        )
+        assert re.search(
+            r"window\.addEventListener\(\s*['\"]langchange['\"]\s*,\s*_syncViewToggle\s*\)",
+            app_js,
+        ), (
+            "_syncViewToggle must be registered as a langchange listener so "
+            "the per-state label is re-translated when the user switches locale"
         )
 
 
