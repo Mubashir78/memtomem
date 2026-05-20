@@ -423,6 +423,117 @@ ollama pull bge-m3
 
 ---
 
+## 10. Network transports (advanced)
+
+Every editor section above launches `memtomem-server` over **stdio** — the
+MCP client spawns the server as a subprocess and talks to it on stdin/stdout.
+That is the right transport for almost every setup; you don't need this
+section unless you specifically want a long-running server an editor on a
+different machine can connect to over the network.
+
+`memtomem-server` also supports two MCP **network transports**:
+
+| Transport | Flag | Notes |
+|-----------|------|-------|
+| Streamable HTTP | `--transport http` (alias for `streamable-http`) | Recommended for new deployments |
+| Server-Sent Events | `--transport sse` | Older transport, kept for editors that haven't moved off SSE |
+
+> **Trusted-network only.** Both network transports speak the MCP protocol
+> with **no built-in authentication**. Bind to loopback (`127.0.0.1`) and
+> put an authenticated reverse proxy in front before exposing publicly.
+> Do not expose them on the public internet without that layer.
+
+### Quick start — Streamable HTTP on loopback
+
+```bash
+memtomem-server \
+  --transport http \
+  --host 127.0.0.1 \
+  --port 8000 \
+  --url http://127.0.0.1:8000/mcp
+```
+
+The server prints the internal and public URLs at startup and waits for
+client connections. Stop it with `Ctrl+C`.
+
+### Behind a reverse proxy
+
+`--url` is the **public endpoint your MCP client connects to**, and the
+URL path is also used as the server's internal endpoint path. Forward the
+public path unchanged to the internal listener:
+
+```bash
+memtomem-server \
+  --transport http \
+  --host 127.0.0.1 \
+  --port 8000 \
+  --url https://mcp.example.com/mcp
+```
+
+For SSE, the URL path is split into a mount point plus the SSE endpoint
+(`https://mcp.example.com/memtomem/events` → mount `/memtomem`, endpoint
+`/events`).
+
+### DNS rebinding protection
+
+By default, `memtomem-server` validates the `Host` and `Origin` headers
+on every request and returns 421 / 403 on a mismatch. This blocks
+DNS-rebinding attacks against the local listener.
+
+The `Host` and `Origin` allow-lists are seeded **asymmetrically**:
+
+- **`Host` allow-list** auto-includes loopback variants (`127.0.0.1` /
+  `localhost` / `[::1]`, each in bare and `:*` port-wildcard form), the
+  hostname from `--url` (bare and `:*` form), the explicit `--host` value
+  when it isn't a wildcard, plus any `--allowed-host` values you pass.
+- **`Origin` allow-list** auto-includes **only** the scheme+host+port
+  derived from `--url` (e.g. `--url https://mcp.example.com/mcp` →
+  `https://mcp.example.com`), plus any `--allowed-origin` values you
+  pass. Loopback Origins are **not** auto-allowed: a browser-style
+  client sending `Origin: http://127.0.0.1:<port>` against a server
+  configured with a non-loopback `--url` will be rejected. Pass
+  `--allowed-origin http://127.0.0.1:<port>` (or `--allowed-origin
+  http://localhost:*`) to test the internal listener from a browser.
+
+- `--allowed-host VALUE` — extra `Host` header to accept. Repeatable.
+  Matching is **exact** unless the value ends in `:*` (port wildcard);
+  most clients send `Host: <hostname>:<port>`, so for non-default ports
+  pass either `<hostname>:*` or the exact `<hostname>:<port>`.
+- `--allowed-origin VALUE` — extra `Origin` header to accept. Repeatable.
+  Same matching rules — typical browser-style Origins look like
+  `http://<hostname>:<port>`, so use `<scheme>://<hostname>:*` or the
+  full `<scheme>://<hostname>:<port>`.
+- `--disable-dns-rebinding-protection` — turn the check off entirely.
+  **Only safe behind an authenticated reverse proxy** that already
+  validates the request origin.
+
+> **`--host 0.0.0.0` binds on all interfaces but does not auto-allow them.**
+> If you bind to `0.0.0.0` without passing a `--url` whose hostname
+> matches how clients reach you, the allow-list stays loopback-only
+> and LAN clients are rejected (HTTP 421 / 403). The simplest fix is
+> to pass `--url http://<reachable-host>:<port>/mcp` — `memtomem-server`
+> derives both port-wildcard (`<reachable-host>:*`) and exact
+> (`<reachable-host>:<port>`) entries from that URL and adds the matching
+> `Origin`. **Advanced:** if you must keep a loopback `--url`, pass both
+> `--allowed-host <reachable-host>:*` **and**
+> `--allowed-origin http://<reachable-host>:<port>` — a bare
+> `--allowed-host <reachable-host>` does **not** match `Host:
+> <reachable-host>:<port>` (the SDK only treats `:*`-suffixed values as
+> port wildcards) and Origin-bearing clients are blocked separately.
+
+### One server at a time
+
+`memtomem-server` takes a per-user pid lock regardless of transport.
+Run **either** the stdio server (spawned by your editor) **or** a network
+server, not both — a second launch logs a warning about concurrent writes
+and leaves the primary server's pid file in place. If you need both MCP
+and Web UI access concurrently, see the [Concurrent MCP + Web server]
+section in the reference guide.
+
+[Concurrent MCP + Web server]: reference.md#concurrent-mcp--web-server
+
+---
+
 ## Troubleshooting
 
 ### Tools don't appear in my editor
@@ -432,7 +543,12 @@ ollama pull bge-m3
 3. Verify the install is reachable: `mm --version` (or `uvx --from memtomem mm --version` for uvx-only setups) — side-effect-free
 4. From inside the editor, ask it to call the `mem_status` tool — a successful response confirms the MCP handshake reached the server
 
-> Don't run `uvx --from memtomem memtomem-server` bare in a terminal as a "does it start?" test — it expects JSON-RPC on stdin, so TTY noise triggers `ERROR` lines that don't reflect install health, and it provisions `~/.memtomem/` on a fresh machine.
+> Running `uvx --from memtomem memtomem-server` bare in a terminal prints
+> a setup hint (MCP client configuration plus the network-transport
+> examples from §10) and exits — it is **not** a "does it serve?" smoke
+> test because no MCP client is connected. To test stdio, configure your
+> editor and call `mem_status` from there; to test a network transport,
+> start the server with `--transport http|sse` and connect a client.
 
 ### "Connection refused" or timeout
 
