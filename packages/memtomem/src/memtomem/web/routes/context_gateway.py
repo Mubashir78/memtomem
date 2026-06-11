@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, Query
@@ -110,6 +111,39 @@ def _redact_message(message: str) -> str:
     if len(redacted) > _ERROR_MESSAGE_LIMIT:
         redacted = redacted[:_ERROR_MESSAGE_LIMIT]
     return redacted
+
+
+def sanitize_diff_reason(message: str | None, project_root: Path) -> str | None:
+    """Display-sanitize an engine diff-row ``reason`` for the wire (#1229 U7).
+
+    Engine reasons are raw exception text with absolute source paths
+    EMBEDDED in arbitrary message strings (not bare paths), so plain
+    ``Path.relative_to`` doesn't apply: strip the project-root prefix
+    wherever it appears inside the message, then apply the same
+    HOME-collapse + secret-shape whole-replace + truncation contract as
+    the overview ``error_message`` field. Shared by every context_* list
+    and per-name diff route so the sanitization boundary cannot drift
+    per kind.
+    """
+    if not message:
+        return None
+    root = str(project_root)
+    cleaned = message.replace(root + os.sep, "").replace(root, ".")
+    return _redact_message(cleaned)
+
+
+def read_text_lenient(path: Path) -> str | None:
+    """Best-effort text read for diff payload previews (#1229 U7).
+
+    ``None`` on any OSError (permission, race-deleted) — a per-name diff
+    endpoint must keep diagnosing instead of 500ing while the engine diff
+    reports the same file as a typed row; non-UTF-8 bytes decode with
+    U+FFFD replacement (the #1233 lenient-read contract).
+    """
+    try:
+        return path.read_bytes().decode("utf-8", errors="replace")
+    except OSError:
+        return None
 
 
 def _compute_last_synced_at(project_root: Path, target_scope: TargetScope) -> str | None:
