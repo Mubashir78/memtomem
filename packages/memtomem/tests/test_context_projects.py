@@ -17,6 +17,7 @@ from pathlib import Path
 import pytest
 
 from memtomem.context.projects import (
+    KnownProjectsCorruptError,
     KnownProjectsStore,
     ProjectHealth,
     ProjectScope,
@@ -329,6 +330,91 @@ def test_store_unknown_version_recovers_to_empty(tmp_path: Path) -> None:
     kp.write_text(json.dumps({"version": 999, "projects": []}))
     store = KnownProjectsStore(kp)
     assert store.load() == []
+
+
+def test_store_projects_not_list_recovers_to_empty(tmp_path: Path) -> None:
+    """Tolerant read degrades on a non-list ``projects`` member — including
+    a non-iterable, which used to crash the loop with TypeError."""
+    kp = tmp_path / "kp.json"
+    store = KnownProjectsStore(kp)
+
+    kp.write_text(json.dumps({"version": 1, "projects": {"root": "/old"}}))
+    assert store.load() == []
+
+    kp.write_text(json.dumps({"version": 1, "projects": 5}))
+    assert store.load() == []
+
+
+# ── corrupt-file mutation refusal (#1247 id 16) ──────────────────────────
+
+
+def _seed_then_corrupt(tmp_path: Path, corrupt: bytes) -> tuple[KnownProjectsStore, Path, Path]:
+    """Register one real project, then overwrite the store file with
+    *corrupt* bytes. Returns ``(store, kp_path, registered_root)``."""
+    registered = tmp_path / "registered"
+    registered.mkdir()
+    kp = tmp_path / "kp.json"
+    store = KnownProjectsStore(kp)
+    store.add(registered)
+    kp.write_bytes(corrupt)
+    return store, kp, registered
+
+
+@pytest.mark.parametrize(
+    "corrupt",
+    [
+        pytest.param(b"not valid {json", id="invalid-json"),
+        pytest.param(b"\xff", id="invalid-utf8"),
+        pytest.param(b'{"version": 999, "projects": []}', id="future-version"),
+        # Valid version-1 JSON whose shape the parser cannot represent —
+        # without the strict shape guard these silently re-baseline too
+        # (Codex impl review): _write re-renders from parsed entries, so a
+        # dropped member/row does not round-trip.
+        pytest.param(b'{"version": 1, "projects": {"root": "/old"}}', id="projects-not-list"),
+        pytest.param(b'{"version": 1, "projects": ["stray-string"]}', id="row-not-object"),
+        pytest.param(b'{"version": 1, "projects": [{"label": "no-root"}]}', id="row-without-root"),
+    ],
+)
+def test_store_add_over_corrupt_file_refuses_and_preserves_bytes(
+    tmp_path: Path, corrupt: bytes
+) -> None:
+    """``add()`` must refuse instead of re-baselining the registered-project
+    list to ``[new_entry]`` — pre-fix, the tolerant load returned ``[]`` and
+    ``_write`` persisted the wipe. Future-version is folded in: ``_write``
+    re-renders at the current version, so mutating a newer file is the same
+    clobber hazard."""
+    store, kp, _ = _seed_then_corrupt(tmp_path, corrupt)
+    newcomer = tmp_path / "newcomer"
+    newcomer.mkdir()
+
+    with pytest.raises(KnownProjectsCorruptError):
+        store.add(newcomer)
+    assert kp.read_bytes() == corrupt  # refusal left the file byte-identical
+
+
+def test_store_remove_over_corrupt_file_refuses(tmp_path: Path) -> None:
+    """Pre-fix this returned ``False`` ("not found") — a misleading no-op."""
+    store, kp, registered = _seed_then_corrupt(tmp_path, b"not valid {json")
+    with pytest.raises(KnownProjectsCorruptError):
+        store.remove_by_scope_id(compute_scope_id(registered))
+    assert kp.read_bytes() == b"not valid {json"
+
+
+def test_store_update_over_corrupt_file_refuses(tmp_path: Path) -> None:
+    """All three PATCH shapes (label-only, enabled-only, combined) go
+    through the same strict load — each must refuse, none may write."""
+    store, kp, registered = _seed_then_corrupt(tmp_path, b"not valid {json")
+    sid = compute_scope_id(registered)
+
+    with pytest.raises(KnownProjectsCorruptError):
+        store.update_entry_by_scope_id(sid, label="x", set_label=True)
+    with pytest.raises(KnownProjectsCorruptError):
+        store.update_entry_by_scope_id(sid, enabled=False, set_enabled=True)
+    with pytest.raises(KnownProjectsCorruptError):
+        store.update_entry_by_scope_id(
+            sid, label="x", set_label=True, enabled=False, set_enabled=True
+        )
+    assert kp.read_bytes() == b"not valid {json"
 
 
 # ── atomic-write race (real OS-level concurrency, RFC bar) ───────────────
