@@ -48,6 +48,7 @@ from memtomem.context.settings_doctor import (
 from memtomem.web.routes._confirm import needs_confirmation_envelope
 from memtomem.web.routes._errors import _error
 from memtomem.web.routes._locks import _gateway_lock
+from memtomem.web.routes.context_gateway import sanitize_diff_reason
 from memtomem.web.routes.context_projects import (
     resolve_scope_root,
     resolve_writable_scope_root,
@@ -154,17 +155,21 @@ def _stale_mtime_response(current_mtime_ns: int | None) -> JSONResponse:
     )
 
 
-def _serialize_duplicate_tiers(duplicates: list[DuplicateTier]) -> list[dict]:
+def _serialize_duplicate_tiers(duplicates: list[DuplicateTier], project_root: Path) -> list[dict]:
     """Serialize :class:`DuplicateTier` results for the JSON response.
 
     Per ADR-0010 §4 the Web hooks panel surfaces this list as a
     read-only banner; the schema mirrors the CLI ``settings-doctor
-    --json`` payload so both surfaces stay in lock-step.
+    --json`` payload so both surfaces stay in lock-step. ``path`` is
+    display-sanitized (#1550): a user-tier duplicate is the absolute
+    ``$HOME``-anchored settings file, the same disclosure class as the
+    sync-result ``target`` below — the banner is display-only, so the
+    collapsed form stays actionable.
     """
     return [
         {
             "tier": dup.tier,
-            "path": str(dup.path),
+            "path": sanitize_diff_reason(str(dup.path), project_root),
             "entries": [
                 {
                     "event": sig.event,
@@ -453,13 +458,24 @@ async def get_settings_sync(
     canonical_path = project_root / CANONICAL_SETTINGS_FILE
     target_path = _claude_target(project_root, target_scope)
     payload = _compare_hooks(canonical_path, target_path)
+    # ``_compare_hooks`` builds its malformed-JSON ``error`` from the absolute
+    # canonical/target path and echoes both paths as fields (#1550 sweep) —
+    # sanitize at the wire boundary so the comparer keeps full paths for any
+    # future non-wire caller. The which-file information survives: the
+    # root-stripped/$HOME-collapsed remainder still names the file, and the
+    # hooks panel uses ``target_path`` for display only (the rule-action POSTs
+    # round-trip mtime tokens and rule identity, never these paths).
+    if payload.get("error"):
+        payload["error"] = sanitize_diff_reason(payload["error"], project_root)
+    payload["canonical_path"] = sanitize_diff_reason(payload["canonical_path"], project_root)
+    payload["target_path"] = sanitize_diff_reason(payload["target_path"], project_root)
     # Surface the active scope so the Web UI can render a scope-accurate
     # target label (issue #962). Without this the panel falls back to a
     # hardcoded "User-scope target:" that lies when the scope is
     # project_shared or project_local.
     payload["target_scope"] = target_scope
     payload["duplicate_tier_warnings"] = _serialize_duplicate_tiers(
-        detect_duplicate_tiers(project_root, active_scope=target_scope)
+        detect_duplicate_tiers(project_root, active_scope=target_scope), project_root
     )
     return payload
 
@@ -519,20 +535,28 @@ async def _sync_settings_core(
         scope=target_scope,
         allow_host_writes=allow_host_writes,
     )
+    # Settings reasons embed absolute ``canonical_path`` / ``target_path``
+    # values (context/settings.py f-strings), and the ok-row target is an
+    # absolute path ($HOME-anchored for user scope) — the settings axis of the
+    # #1412 reason sweep (#1550). Same treatment as the MCP twin
+    # (``server/tools/context.py`` settings loops); warnings are label/event
+    # prose, no paths. The needs_confirmation host-path disclosure contract
+    # survives the collapse: the confirm modal shows ``~/.claude/...`` and the
+    # re-POST carries only ``allow_host_writes``, never the path.
     out: list[dict] = []
     for name, r in results.items():
         out.append(
             {
                 "name": name,
                 "status": r.status,
-                "reason": r.reason,
+                "reason": sanitize_diff_reason(r.reason, project_root),
                 "warnings": r.warnings,
-                "target": str(r.target) if r.target else None,
+                "target": (sanitize_diff_reason(str(r.target), project_root) if r.target else None),
             }
         )
     return {
         "results": out,
-        "duplicate_tier_warnings": _serialize_duplicate_tiers(duplicates),
+        "duplicate_tier_warnings": _serialize_duplicate_tiers(duplicates, project_root),
     }
 
 
@@ -986,6 +1010,11 @@ async def promote_target_rule(
                     project_root=project_root,
                 )
                 if fragment_scan.decision in ("blocked", "blocked_project_shared"):
+                    # The remediation hint names the file holding the secret —
+                    # display-sanitized (#1550): the root-stripped/$HOME-collapsed
+                    # form still points at the exact file, without echoing the
+                    # absolute host path over the wire. (The rest of the Gate A
+                    # message uses ``blocked.path.name`` — already path-free.)
                     raise HTTPException(
                         422,
                         format_scan_block_message(
@@ -995,8 +1024,8 @@ async def promote_target_rule(
                             artifact_name=label,
                             remediation_hint=(
                                 f"Remove the secret from the hook rule in "
-                                f"{target_path}, or keep the rule in your "
-                                f"private tier."
+                                f"{sanitize_diff_reason(str(target_path), project_root)}, "
+                                f"or keep the rule in your private tier."
                             ),
                         ),
                     )

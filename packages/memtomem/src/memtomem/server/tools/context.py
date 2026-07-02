@@ -171,13 +171,22 @@ def _settings_dup_tier_warnings(root: Path, active_scope: str) -> list[str]:
     memtomem-managed hook was duplicated in a non-active tier. Surface them
     here so the MCP and CLI settings surfaces agree. Non-blocking — duplicates
     are informational.
+
+    ``format_warning`` embeds the raw tier path — absolute ``$HOME`` for a
+    user-tier duplicate — so redact the PATH before formatting (#1550, the
+    dup-tier leg the #1539 sweep missed). Redacting the formatted line instead
+    would hit the 200-char ``redact_message`` cap and truncate the migrate
+    hint; the path-only substitution keeps the CLI-parity wording whole.
     """
+    from dataclasses import replace
+
     from memtomem.context.settings_doctor import detect_duplicate_tiers, format_warning
 
-    return [
-        f"  warning: {format_warning(dup, active_scope=active_scope)}"
-        for dup in detect_duplicate_tiers(root, active_scope=active_scope)
-    ]
+    lines: list[str] = []
+    for dup in detect_duplicate_tiers(root, active_scope=active_scope):
+        redacted = replace(dup, path=Path(_redact_reason(str(dup.path), root)))
+        lines.append(f"  warning: {format_warning(redacted, active_scope=active_scope)}")
+    return lines
 
 
 @mcp.tool()
