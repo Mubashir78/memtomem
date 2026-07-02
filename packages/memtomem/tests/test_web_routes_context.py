@@ -77,7 +77,7 @@ def _make_skill(tmp_path: Path, name: str, content: str = "# Test skill\n") -> P
     """Create a canonical skill directory with SKILL.md."""
     skill_dir = tmp_path / ".memtomem" / "skills" / name
     skill_dir.mkdir(parents=True, exist_ok=True)
-    (skill_dir / SKILL_MANIFEST).write_text(content, encoding="utf-8")
+    _write_text_lf(skill_dir / SKILL_MANIFEST, content)
     return skill_dir
 
 
@@ -90,7 +90,7 @@ def _make_runtime_skill(
     """Create a runtime skill directory."""
     skill_dir = tmp_path / runtime_dir / name
     skill_dir.mkdir(parents=True, exist_ok=True)
-    (skill_dir / SKILL_MANIFEST).write_text(content, encoding="utf-8")
+    _write_text_lf(skill_dir / SKILL_MANIFEST, content)
     return skill_dir
 
 
@@ -177,7 +177,7 @@ class TestOverview:
         # .gemini/skills/foo/SKILL.md → gemini detected via skill dir
         gem_skill = tmp_path / ".gemini" / "skills" / "foo"
         gem_skill.mkdir(parents=True)
-        (gem_skill / SKILL_MANIFEST).write_text("# g\n", encoding="utf-8")
+        _write_text_lf(gem_skill / SKILL_MANIFEST, "# g\n")
 
         r = await client.get("/api/context/overview")
         runtimes = {r["name"]: r["available"] for r in r.json()["detected_runtimes"]}
@@ -206,7 +206,7 @@ class TestOverview:
     ):
         local = tmp_path / ".memtomem" / "skills.local" / "draft"
         local.mkdir(parents=True)
-        (local / SKILL_MANIFEST).write_text("# Draft\n", encoding="utf-8")
+        _write_text_lf(local / SKILL_MANIFEST, "# Draft\n")
 
         default = await client.get("/api/context/overview")
         assert default.json()["target_scope"] == "project_shared"
@@ -716,7 +716,7 @@ class TestListSkills:
     ):
         local = tmp_path / ".memtomem" / "skills.local" / "draft"
         local.mkdir(parents=True)
-        (local / SKILL_MANIFEST).write_text("# Draft\n", encoding="utf-8")
+        _write_text_lf(local / SKILL_MANIFEST, "# Draft\n")
 
         default = await client.get("/api/context/skills")
         assert all(s["name"] != "draft" for s in default.json()["skills"])
@@ -998,10 +998,10 @@ class TestDiffSkill:
         content = "# User skill\n"
         skill_dir = home / ".memtomem" / "skills" / "scoped"
         skill_dir.mkdir(parents=True)
-        (skill_dir / SKILL_MANIFEST).write_text(content, encoding="utf-8")
+        _write_text_lf(skill_dir / SKILL_MANIFEST, content)
         rt_dir = home / ".claude" / "skills" / "scoped"
         rt_dir.mkdir(parents=True)
-        (rt_dir / SKILL_MANIFEST).write_text(content, encoding="utf-8")
+        _write_text_lf(rt_dir / SKILL_MANIFEST, content)
 
         r = await client.get("/api/context/skills/scoped/diff", params={"target_scope": "user"})
         assert r.status_code == 200
@@ -1017,7 +1017,7 @@ class TestDiffSkill:
         must not fabricate runtime rows against project_shared paths (#1229)."""
         local_dir = tmp_path / ".memtomem" / "skills.local" / "draft"
         local_dir.mkdir(parents=True)
-        (local_dir / SKILL_MANIFEST).write_text("# Draft\n", encoding="utf-8")
+        _write_text_lf(local_dir / SKILL_MANIFEST, "# Draft\n")
 
         r = await client.get(
             "/api/context/skills/draft/diff", params={"target_scope": "project_local"}
@@ -2114,7 +2114,7 @@ class TestImportOneAgent:
 def _make_local_skill(tmp_path: Path, name: str, content: str = "# Local\n") -> Path:
     skill_dir = tmp_path / ".memtomem" / "skills.local" / name
     skill_dir.mkdir(parents=True, exist_ok=True)
-    (skill_dir / SKILL_MANIFEST).write_text(content, encoding="utf-8")
+    _write_text_lf(skill_dir / SKILL_MANIFEST, content)
     return skill_dir
 
 
