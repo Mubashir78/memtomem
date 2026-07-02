@@ -458,6 +458,40 @@ async def test_diff_settings_reasons_redact_absolute_paths(
     assert "error codex_settings:" in out
 
 
+@pytest.mark.anyio
+async def test_generate_settings_dup_tier_warning_redacts_path_untruncated(
+    layout, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Dup-tier warning lines redact the tier path (#1550 — the leg #1539 missed).
+
+    Only the PATH is substituted before ``format_warning`` runs: redacting the
+    formatted line would hit the 200-char ``redact_message`` cap and truncate
+    the migrate hint, so pin the tail's survival too. (The $HOME-collapse of a
+    user-tier path is pinned at the web boundary and in the neutral-redactor
+    contract tests; ``layout``'s fake HOME differs from the import-frozen
+    ``_HOME`` anchor, so this pin uses an in-root project_local duplicate.)
+    """
+    from memtomem.context import settings as ctx_settings
+    from memtomem.context import settings_doctor as ctx_doctor
+    from memtomem.server.tools.context import mem_context_generate
+
+    root = layout["project_root"]
+    dup = ctx_doctor.DuplicateTier(
+        tier="project_local",
+        path=root / ".claude" / "settings.local.json",
+        entries=(ctx_doctor.HookSignature("PreToolUse", "Bash", "echo ok"),),
+    )
+    monkeypatch.setattr(ctx_doctor, "detect_duplicate_tiers", lambda *a, **k: [dup])
+    monkeypatch.setattr(ctx_settings, "generate_all_settings", lambda *a, **k: {})
+
+    out = await mem_context_generate(include="settings")
+
+    _assert_no_abs_path(out, root)
+    assert f"({Path('.claude/settings.local.json')})" in out  # root-stripped, still named
+    assert "settings-migrate" in out  # the remediation command survives
+    assert "Active scope:" in out  # the tail survives — no 200-char cap bite
+
+
 # ── parity guard: the neutral leaf must not drift from the web twins ─────────
 
 
