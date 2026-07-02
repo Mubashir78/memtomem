@@ -38,6 +38,22 @@ def _reset_counters():
     privacy.reset_for_tests()
 
 
+# Golden SHA-256 over the newline-joined ``DEFAULT_PATTERNS`` strings.
+# ``test_pattern_count_pinned`` catches a silent add/drop; this catches a
+# silent EDIT of a pattern body. The set is mirrored byte-identical and
+# same-order with memtomem-stm's ``CREDENTIAL_PATTERNS`` (see the privacy.py
+# module docstring), and the STM suite pins the SAME constant (same variable
+# name, greppable across both repos), so tightening one side alone fails
+# that side's suite — updating a pattern is a deliberate two-sided bump.
+# A cross-import equality test is off the table by design: STM holds no
+# Python-level dependency on memtomem core (memtomem-stm#559). During a
+# deliberate divergence window (one side merged ahead of its sync — e.g. an
+# LTM-origin addition awaiting its reverse mirror), bump the leading side's
+# constant with a sync-tracking note, then re-align the trailing side's
+# constant when the sync lands.
+_SECRET_CLASS_SET_SHA256 = "237d505d119c08ba85fc4474aa85bd07c603439809d03915331fab6b435a9f65"
+
+
 class TestPatternSurface:
     def test_pattern_count_pinned(self):
         # 12 STM-synced secret-class patterns (incl. the memtomem-stm#553
@@ -46,6 +62,15 @@ class TestPatternSurface:
         # deliberately when adding a pattern so a silent add/drop surfaces
         # here.
         assert len(privacy.DEFAULT_PATTERNS) == 19
+
+    def test_pattern_content_pinned_for_stm_sync(self):
+        joined = "\n".join(privacy.DEFAULT_PATTERNS).encode("utf-8")
+        assert hashlib.sha256(joined).hexdigest() == _SECRET_CLASS_SET_SHA256, (
+            "DEFAULT_PATTERNS content changed — this set is mirrored "
+            "byte-identical and same-order with memtomem-stm's "
+            "CREDENTIAL_PATTERNS; bump _SECRET_CLASS_SET_SHA256 together "
+            "with the STM-side pin of the same name (memtomem-stm#559)"
+        )
 
     @pytest.mark.parametrize(
         "clean_input",
