@@ -13,6 +13,13 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
   `mem_context_memory_migrate` (or the `mem_do` action
   `context_memory_migrate`); the `mem_do` action alias `context_migrate`
   follows the same timeline.
+- **`mm init -y` as a wizard-skip alias** (deprecated in #1616, flag split +
+  warning in #1631) — `-y` and `--non-interactive` are now separate flags;
+  `-y` still implies `--non-interactive` but every use emits a stderr
+  deprecation warning. **Behavior-change target: v0.5.0**, when `-y` on
+  `mm init` becomes an accepted no-op (init has no confirmation prompt to
+  skip). Scripts should use `--non-interactive`, ideally with an explicit
+  `--preset`.
 
 ### Added
 

@@ -68,9 +68,9 @@ The interactive picker starts with three presets — **Minimal** (BM25, no downl
 For automation / CI:
 
 ```bash
-mm init -y                            # minimal preset, same as before
-mm init --preset korean -y            # Korean-optimized bundle, no prompts
-mm init --advanced                    # force the full 10-step wizard
+mm init --non-interactive                   # minimal preset, no prompts
+mm init --preset korean --non-interactive   # Korean-optimized bundle, no prompts
+mm init --advanced                          # force the full 10-step wizard
 ```
 
 See [Embeddings](docs/guides/embeddings.md) for the full model/provider matrix.

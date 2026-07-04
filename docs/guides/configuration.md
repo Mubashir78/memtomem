@@ -450,7 +450,7 @@ searchable.
 Non-interactive mode supports `--include-provider` (repeatable):
 
 ```bash
-mm init -y --include-provider claude-memory --include-provider codex
+mm init --non-interactive --include-provider claude-memory --include-provider codex
 ```
 
 Asking for a category with no detected dirs is a silent no-op, not an

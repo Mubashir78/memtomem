@@ -185,25 +185,27 @@ Type `b` to go back or `q` to quit at any prompt.
 
 #### Non-interactive mode (CI / automation)
 
-Skip prompting with `-y`. `mm init -y` alone applies the **Minimal** preset (same defaults as before this feature landed); pass `--preset` for the others:
+Skip prompting with `--non-interactive`. `mm init --non-interactive` alone applies the **Minimal** preset (same defaults as before this feature landed); pass `--preset` for the others:
 
 ```bash
-mm init -y                                              # Minimal preset (BM25-only)
-mm init --preset english -y                             # English recommended
-mm init --preset korean -y                              # Korean-optimized
-mm init --advanced                                      # Force the full 10-step wizard
+mm init --non-interactive                                              # Minimal preset (BM25-only)
+mm init --preset english --non-interactive                             # English recommended
+mm init --preset korean --non-interactive                              # Korean-optimized
+mm init --advanced                                                     # Force the full 10-step wizard
 
 # Explicit flags override preset values:
-mm init -y --provider onnx --model all-MiniLM-L6-v2     # custom ONNX model
-mm init -y --provider ollama --model nomic-embed-text   # Ollama (requires `ollama serve`)
-mm init -y --provider openai --api-key sk-...           # OpenAI
-mm init -y --memory-dir ~/notes --mcp claude            # custom dir + Claude Code auto-setup
+mm init --non-interactive --provider onnx --model all-MiniLM-L6-v2     # custom ONNX model
+mm init --non-interactive --provider ollama --model nomic-embed-text   # Ollama (requires `ollama serve`)
+mm init --non-interactive --provider openai --api-key sk-...           # OpenAI
+mm init --non-interactive --memory-dir ~/notes --mcp claude            # custom dir + Claude Code auto-setup
 
 # Pull in AI tool memory folders (repeat per category):
-mm init -y --include-provider claude-memory --include-provider codex
+mm init --non-interactive --include-provider claude-memory --include-provider codex
 ```
 
-`--preset` and `--advanced` are mutually exclusive. Running without `-y` / `--preset` / `--advanced` from a non-TTY (e.g., piped stdin) exits with an error — pass one of those flags explicitly.
+`-y` is a deprecated alias for `--non-interactive` on `mm init` and will stop implying it in v0.5.0 (it becomes an accepted no-op — `init` has no confirmation prompt to skip).
+
+`--preset` and `--advanced` are mutually exclusive. From a non-TTY (e.g., piped stdin), always pass `--non-interactive` — `--preset` and `--advanced` on their own still run wizard prompts, so scripted runs without `--non-interactive` either exit with an error or cancel without writing a config.
 
 <details>
 <summary><b>Advanced: the full 10-step wizard</b></summary>

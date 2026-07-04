@@ -392,16 +392,18 @@ def _have_module(name: str) -> bool:
 
 
 def _y_refuse_hint(flag: str, extra: str) -> str:
-    """Wizard → ``-y`` discoverability bridge (#403).
+    """Wizard → scripted-run discoverability bridge (#403).
 
-    Interactive wizard warns-and-saves when an extra is missing; ``mm init -y``
-    refuses with a non-zero exit (#396 / #402). A user who copies a wizard
-    choice into a scripted install gets an unexpected hard failure without
-    this hint. Surface the asymmetry at the wizard warning site.
+    Interactive wizard warns-and-saves when an extra is missing;
+    ``mm init --non-interactive`` refuses with a non-zero exit (#396 / #402).
+    A user who copies a wizard choice into a scripted install gets an
+    unexpected hard failure without this hint. Surface the asymmetry at the
+    wizard warning site. (Named after the legacy ``-y`` spelling; the hint
+    text teaches ``--non-interactive`` since the #1631 flag split.)
     """
     return (
-        f"  Note: `mm init -y {flag}` refuses without `memtomem[{extra}]`; "
-        f"install first for scripted setups."
+        f"  Note: `mm init --non-interactive {flag}` refuses without "
+        f"`memtomem[{extra}]`; install first for scripted setups."
     )
 
 
@@ -2952,15 +2954,22 @@ _MODEL_DIMS: dict[str, int] = {
 
 @click.command("init")
 @click.option(
-    "-y",
     "--non-interactive",
     is_flag=True,
     help=(
         "Skip the wizard. Without --preset this applies `--preset minimal` "
-        "(BM25-only, no embeddings) — unlike -y elsewhere in the CLI, it "
-        "selects configuration, not just prompt-skipping. A future release "
-        "will narrow -y to confirmation-skipping only; scripts should pass "
-        "an explicit --preset."
+        "(BM25-only, no embeddings); scripts should pass an explicit "
+        "--preset."
+    ),
+)
+@click.option(
+    "-y",
+    "legacy_yes",
+    is_flag=True,
+    help=(
+        "Deprecated alias for --non-interactive. From v0.5.0, -y on "
+        "`mm init` will be accepted but ignored (init has no confirmation "
+        "prompt to skip); use --non-interactive in scripts."
     ),
 )
 @click.option("--provider", type=click.Choice(["none", "onnx", "ollama", "openai"]), default=None)
@@ -3012,8 +3021,9 @@ _MODEL_DIMS: dict[str, int] = {
     help=(
         "Apply a preset bundle (minimal | english | korean) of embedding, "
         "reranker, tokenizer, and namespace defaults. Without this flag, the "
-        "interactive picker asks at startup; `mm init -y` alone behaves as "
-        "`--preset minimal -y`. Mutually exclusive with --advanced."
+        "interactive picker asks at startup; `mm init --non-interactive` alone "
+        "behaves as `--preset minimal --non-interactive`. Mutually exclusive "
+        "with --advanced."
     ),
 )
 @click.option(
@@ -3027,6 +3037,7 @@ _MODEL_DIMS: dict[str, int] = {
 )
 def init(
     non_interactive: bool,
+    legacy_yes: bool,
     provider: str | None,
     model: str | None,
     memory_dir: str | None,
@@ -3070,6 +3081,23 @@ def init(
         click.secho("  Detected: uvx (ephemeral) install", fg="blue")
         click.echo()
 
+    if legacy_yes:
+        # #1616/#1631 stage 2: `-y` is now a separate flag so the deprecation
+        # warning fires only for the legacy spelling — --non-interactive users
+        # are already on the stage-3 entry point. Warn on every parsed `-y`
+        # use, before any usage-error exit and preset or not: at v0.5.0 `-y`
+        # stops implying --non-interactive entirely, so `-y --preset english`
+        # scripts break too.
+        click.secho(
+            "  Deprecated: `-y` as a wizard-skip alias for --non-interactive "
+            "will be removed in v0.5.0; `mm init -y` will then run the wizard "
+            "(-y becomes a no-op — init has no confirmation prompt). "
+            "Use --non-interactive in scripts. (#1631)",
+            fg="yellow",
+            err=True,
+        )
+        non_interactive = True
+
     if preset and advanced:
         raise click.UsageError("--preset and --advanced are mutually exclusive")
 
@@ -3087,24 +3115,22 @@ def init(
     ]
 
     if non_interactive:
-        # `mm init -y` alone behaves as `--preset minimal -y`; minimal's defaults
-        # match the previous non-interactive block's (provider="none", no rerank,
-        # unicode61, auto_ns=False, top_k=10). Explicit flags then override the
-        # preset baseline, preserving the prior `-y --provider onnx --model X`
+        # `mm init --non-interactive` alone behaves as `--preset minimal
+        # --non-interactive`; minimal's defaults match the previous
+        # non-interactive block's (provider="none", no rerank, unicode61,
+        # auto_ns=False, top_k=10). Explicit flags then override the preset
+        # baseline, preserving the prior `-y --provider onnx --model X`
         # contract.
         if preset is None:
-            # #1616: everywhere else in the CLI `-y` means "skip the
-            # confirmation prompt"; here it silently selects a materially
-            # weaker setup than the wizard's default (english). Until the
-            # flag split lands, say so loudly — on stderr, so scripted
-            # stdout parsing is unaffected.
+            # #1616: skipping the wizard silently selects a materially
+            # weaker setup than the wizard's default (english). Say so
+            # loudly — on stderr, so scripted stdout parsing is unaffected.
             click.secho(
-                "  Note: -y without --preset applies the 'minimal' preset "
-                "(BM25 keyword search only, no embeddings); the interactive "
-                "wizard defaults to 'english'. Pass --preset "
+                "  Note: --non-interactive without --preset applies the "
+                "'minimal' preset (BM25 keyword search only, no embeddings); "
+                "the interactive wizard defaults to 'english'. Pass --preset "
                 "minimal|english|korean to choose explicitly, or run "
-                "`mm init` for the wizard. A future release will narrow -y "
-                "to confirmation-skipping only.",
+                "`mm init` for the wizard.",
                 fg="yellow",
                 err=True,
             )
@@ -3146,7 +3172,7 @@ def init(
         if required:
             hint = _extra_install_hint(required, state)
             raise click.ClickException(
-                f"Missing required extras for `mm init -y`: "
+                f"Missing required extras for `mm init --non-interactive`: "
                 f"{', '.join(required)}.\n"
                 f"  Install first: {hint}\n"
                 f"  Or drop the flag(s) that require them "
@@ -3178,7 +3204,10 @@ def init(
     else:
         # Default interactive path: show the preset picker, dispatch on choice.
         if not _isatty():
-            raise click.UsageError("Non-interactive terminal detected. Pass --preset <name> or -y.")
+            raise click.UsageError(
+                "Non-interactive terminal detected. Pass --non-interactive "
+                "(optionally with --preset <name>)."
+            )
         # Combine the picker with its follow-up steps in ONE run_steps call so
         # "b" at ``_step_memory_dir`` navigates back to the picker (#371). The
         # previous split ran picker alone in a separate call, which left

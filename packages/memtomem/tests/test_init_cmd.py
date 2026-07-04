@@ -6418,7 +6418,7 @@ class TestYRefuseHintParity:
         from memtomem.cli import init_cmd
 
         hint = init_cmd._y_refuse_hint("--provider onnx", "onnx")
-        assert "mm init -y --provider onnx" in hint
+        assert "mm init --non-interactive --provider onnx" in hint
         assert "memtomem[onnx]" in hint
         assert "refuses" in hint
         assert "scripted" in hint
@@ -6564,12 +6564,13 @@ class TestBackNavThroughSilentStep:
 
 
 class TestNonInteractivePresetNotice:
-    """#1616: ``-y`` is the only CLI flag whose meaning goes beyond
-    "skip the confirmation prompt" — it silently selects ``--preset
-    minimal``, a materially weaker setup than the wizard's default
-    (english). Until the flag split lands, the implicit-preset run must
-    say so loudly on stderr, and an explicit ``--preset`` must silence
-    the notice."""
+    """#1616 / #1631 stage 2: ``--non-interactive`` selects ``--preset
+    minimal`` when no preset is given — a materially weaker setup than the
+    wizard's default (english) — so the implicit-preset run must say so
+    loudly on stderr, and an explicit ``--preset`` must silence that note.
+    ``-y`` is now a separate deprecated-alias flag: every ``-y`` use (preset
+    or not) must emit a deprecation warning naming v0.5.0, while the
+    ``--non-interactive`` spelling must never trigger it."""
 
     def _setup(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         from memtomem.cli import init_cmd
@@ -6591,11 +6592,16 @@ class TestNonInteractivePresetNotice:
         result = CliRunner().invoke(cli, ["init", "-y", "--mcp", "skip"])
 
         assert result.exit_code == 0, result.output
+        # Deprecation warning for the -y spelling, naming the target version.
+        assert "Deprecated:" in result.stderr
+        assert "will be removed in v0.5.0" in result.stderr
+        assert "--non-interactive" in result.stderr
+        # Implicit-preset note still fires when no --preset is given.
         assert "'minimal' preset" in result.stderr
         assert "wizard defaults to 'english'" in result.stderr
-        assert "confirmation-skipping only" in result.stderr
-        # stderr only — scripted stdout consumers must not see the notice.
+        # stderr only — scripted stdout consumers must not see either notice.
         assert "'minimal' preset" not in result.stdout
+        assert "Deprecated:" not in result.stdout
         assert (tmp_path / ".memtomem" / "config.json").exists()
 
     def test_explicit_preset_silences_notice(
@@ -6611,7 +6617,111 @@ class TestNonInteractivePresetNotice:
 
         assert result.exit_code == 0, result.output
         assert "'minimal' preset" not in result.stderr
+        # The -y deprecation warning is NOT preset-gated: at v0.5.0 the flag
+        # stops implying --non-interactive entirely, so `-y --preset english`
+        # scripts break too and must be warned now.
+        assert "will be removed in v0.5.0" in result.stderr
         assert (tmp_path / ".memtomem" / "config.json").exists()
+
+    def test_non_interactive_spelling_no_deprecation(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from click.testing import CliRunner
+
+        from memtomem.cli import cli
+
+        self._setup(tmp_path, monkeypatch)
+
+        result = CliRunner().invoke(cli, ["init", "--non-interactive", "--mcp", "skip"])
+
+        assert result.exit_code == 0, result.output
+        # The stage-3 spelling gets the implicit-preset note but never the
+        # deprecation warning.
+        assert "'minimal' preset" in result.stderr
+        assert "Deprecated:" not in result.stderr
+        assert (tmp_path / ".memtomem" / "config.json").exists()
+
+    def test_yes_equals_non_interactive_behavior(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Parity pin for the deprecation window: until v0.5.0, `-y` must
+        produce byte-identical config to `--non-interactive`."""
+        import json
+
+        from click.testing import CliRunner
+
+        from memtomem.cli import cli
+
+        configs: list[dict] = []
+        for flag in ("-y", "--non-interactive"):
+            home = tmp_path / flag.lstrip("-")
+            home.mkdir()
+            self._setup(home, monkeypatch)
+            result = CliRunner().invoke(cli, ["init", flag, "--mcp", "skip"])
+            assert result.exit_code == 0, result.output
+            configs.append(json.loads((home / ".memtomem" / "config.json").read_text()))
+        assert configs[0] == configs[1]
+
+    def test_usage_error_still_emits_deprecation(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The -y warning fires before validation exits, so even a rejected
+        `-y --preset X --advanced` invocation teaches the migration."""
+        from click.testing import CliRunner
+
+        from memtomem.cli import cli
+
+        self._setup(tmp_path, monkeypatch)
+
+        result = CliRunner().invoke(cli, ["init", "-y", "--preset", "english", "--advanced"])
+
+        assert result.exit_code != 0
+        assert "mutually exclusive" in result.stderr
+        assert "will be removed in v0.5.0" in result.stderr
+
+    def test_missing_extras_error_teaches_non_interactive(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """#1631: failure paths on the new spelling must not teach the
+        deprecated `-y` alias."""
+        from click.testing import CliRunner
+
+        from memtomem.cli import cli, init_cmd
+
+        set_home(monkeypatch, tmp_path)
+        monkeypatch.setattr(init_cmd, "_runtime_profile", lambda: _make_test_profile(kind="pypi"))
+        monkeypatch.setattr(
+            "importlib.util.find_spec",
+            lambda name: None if name == "fastembed" else object(),
+        )
+        monkeypatch.setattr("memtomem.cli.web._missing_web_deps", lambda: None, raising=False)
+
+        result = CliRunner().invoke(
+            cli, ["init", "--non-interactive", "--provider", "onnx", "--mcp", "skip"]
+        )
+
+        assert result.exit_code != 0, result.output
+        assert "Missing required extras for `mm init --non-interactive`" in result.output
+        assert "mm init -y" not in result.output
+
+    def test_non_tty_error_recommends_non_interactive(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """#1631: the non-TTY guard must point at --non-interactive, not the
+        deprecated `-y`, and not suggest --preset alone (which still prompts)."""
+        from click.testing import CliRunner
+
+        from memtomem.cli import cli, init_cmd
+
+        self._setup(tmp_path, monkeypatch)
+        monkeypatch.setattr(init_cmd, "_isatty", lambda: False)
+
+        result = CliRunner().invoke(cli, ["init"])
+
+        assert result.exit_code != 0
+        assert "Non-interactive terminal detected" in result.stderr
+        assert "--non-interactive" in result.stderr
+        assert "or -y" not in result.stderr
 
     def test_help_documents_preset_side_effect(self) -> None:
         from click.testing import CliRunner
@@ -6621,12 +6731,14 @@ class TestNonInteractivePresetNotice:
         result = CliRunner().invoke(cli, ["init", "--help"])
 
         assert result.exit_code == 0
-        # The -y help must name the side-effect and the planned narrowing,
-        # not just "skip wizard". Normalize whitespace — click re-wraps
-        # help text, splitting words across lines.
+        # Normalize whitespace — click re-wraps help text, splitting words
+        # across lines.
         normalized = " ".join(result.output.split())
+        # --non-interactive help names the implicit-preset side effect.
         assert "`--preset minimal` (BM25-only, no embeddings)" in normalized
-        assert "A future release will narrow -y" in normalized
+        # -y is documented as a deprecated alias with the target version.
+        assert "Deprecated alias for --non-interactive" in normalized
+        assert "From v0.5.0" in normalized
 
 
 class TestStepHeaderPosition:
