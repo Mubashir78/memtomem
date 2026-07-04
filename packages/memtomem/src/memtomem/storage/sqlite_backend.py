@@ -57,7 +57,7 @@ from memtomem.storage.mixins import (
     SessionMixin,
     ShareLinkMixin,
 )
-from memtomem.storage.sqlite_schema import create_tables
+from memtomem.storage.sqlite_schema import check_schema_downgrade, create_tables
 
 logger = logging.getLogger(__name__)
 
@@ -157,6 +157,10 @@ class SqliteBackend(
             self._db.enable_load_extension(True)
             sqlite_vec.load(self._db)
             self._db.enable_load_extension(False)
+            # Downgrade fence before any write — the journal-mode PRAGMAs
+            # below mutate the DB file, and a refused open (newer DB, older
+            # binary) must leave it byte-identical for the newer release.
+            check_schema_downgrade(self._db)
         except Exception:
             self._db.close()
             self._db = None

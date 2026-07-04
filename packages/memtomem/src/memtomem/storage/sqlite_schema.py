@@ -8,7 +8,7 @@ import re
 import sqlite3
 from datetime import datetime, timezone
 
-from memtomem.errors import EmbeddingDimensionMismatchError
+from memtomem.errors import EmbeddingDimensionMismatchError, SchemaDowngradeError
 from memtomem.storage.sqlite_meta import MetaManager
 
 logger = logging.getLogger(__name__)
@@ -33,6 +33,55 @@ _TAGS_UNICODE_REPAIR_KEY = "tags_unicode_repair_v1"
 # Matches a single ``\uXXXX`` BMP escape sequence as literal text (a backslash,
 # a ``u``, then four hex digits) — what a mis-decoded tag still carries.
 _UNICODE_ESCAPE_RE = re.compile(r"\\u[0-9a-fA-F]{4}")
+
+# Monotonic schema generation for the downgrade fence (#1614). Bump by 1
+# whenever create_tables gains a migration an older binary must not run
+# under. Same-or-older stored versions always pass (migrations stay
+# additive + idempotent); only stored > SCHEMA_VERSION is fatal.
+SCHEMA_VERSION = 1
+
+_SCHEMA_VERSION_KEY = "schema_version"
+
+
+def check_schema_downgrade(db: sqlite3.Connection) -> None:
+    """Raise :class:`SchemaDowngradeError` if the DB records a newer schema version.
+
+    Read-only — safe to call before any mutating setup (journal-mode PRAGMAs,
+    table creation), so a refused open leaves the DB file untouched. A missing
+    meta table or missing key means a fresh or pre-versioning DB and passes.
+    A non-integer value cannot be a legitimate newer version (all binaries
+    write integers) — it is evidence of corruption or hand-editing, so warn
+    loudly and pass; the stamp at the end of ``create_tables`` overwrites it
+    with the truth.
+    """
+    try:
+        row = db.execute(
+            "SELECT value FROM _memtomem_meta WHERE key = ?", (_SCHEMA_VERSION_KEY,)
+        ).fetchone()
+    except sqlite3.OperationalError as e:
+        if "no such table" in str(e).lower():
+            return
+        raise
+    if row is None:
+        return
+    try:
+        stored_ver = int(row[0])
+    except ValueError:
+        logger.warning(
+            "Non-integer schema_version %r in _memtomem_meta — treating as "
+            "pre-versioning and restamping to %d.",
+            row[0],
+            SCHEMA_VERSION,
+        )
+        return
+    if stored_ver > SCHEMA_VERSION:
+        raise SchemaDowngradeError(
+            f"This database has schema version {stored_ver}, but this "
+            f"memtomem binary only supports up to {SCHEMA_VERSION}. "
+            f"The database was created or migrated by a newer memtomem "
+            f"release. Upgrade memtomem to open it: "
+            f"'uv tool upgrade memtomem' or 'pip install -U memtomem'."
+        )
 
 
 def create_tables(
@@ -65,6 +114,12 @@ def create_tables(
             value TEXT NOT NULL
         )
     """)
+
+    # ---- schema-version downgrade fence (#1614) ----
+    # Must run before any migration touches user data. SqliteBackend also
+    # runs this check earlier, before its journal-mode PRAGMAs, so a refused
+    # open never writes; this second call covers direct callers.
+    check_schema_downgrade(db)
 
     db.execute("""
         CREATE TABLE IF NOT EXISTS chunks (
@@ -557,6 +612,24 @@ def create_tables(
         )
     """)
     db.execute("CREATE INDEX IF NOT EXISTS idx_schedules_enabled ON schedules(enabled)")
+
+    # ---- stamp schema version (monotonic, after migrations) ----
+    # After, not before: a failed migration must not leave the DB claiming a
+    # version it doesn't have. Atomic upsert — racing processes can never
+    # lower a canonical newer value; an equal value writes 0 rows. The second
+    # WHERE clause restamps any non-canonical-integer text (e.g. '2abc',
+    # '1.9') that the fence treated as corruption — SQLite CAST alone would
+    # read its numeric prefix and leave it in place, disagreeing with the
+    # fence's int() rule.
+    db.execute(
+        """
+        INSERT INTO _memtomem_meta(key, value) VALUES(?, ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value
+        WHERE CAST(_memtomem_meta.value AS INTEGER) < CAST(excluded.value AS INTEGER)
+           OR _memtomem_meta.value != CAST(CAST(_memtomem_meta.value AS INTEGER) AS TEXT)
+        """,
+        (_SCHEMA_VERSION_KEY, str(SCHEMA_VERSION)),
+    )
 
     db.commit()
 

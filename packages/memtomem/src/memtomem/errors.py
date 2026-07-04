@@ -22,6 +22,17 @@ class EmbeddingDimensionMismatchError(StorageError):
     """
 
 
+class SchemaDowngradeError(StorageError):
+    """Raised when the DB's stored schema version is newer than this binary's.
+
+    A newer memtomem release ran migrations this binary does not know about.
+    Migrations are additive/idempotent, so same-or-older versions always
+    pass — this fence only blocks the downgrade direction, where an old
+    binary could misread structures it has never seen. Fail-fast at open
+    with an upgrade remediation instead of undefined behavior later.
+    """
+
+
 class EmbeddingError(Mem2MemError):
     """Embedding provider error."""
 

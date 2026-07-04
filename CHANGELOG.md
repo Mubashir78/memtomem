@@ -5,6 +5,16 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 
 ## [Unreleased]
 
+### Added
+
+- **Schema-version downgrade fence** (#1614) — the database now records a
+  monotonic `schema_version` in `_memtomem_meta`; opening a database written
+  by a newer memtomem release fails fast with a typed `SchemaDowngradeError`
+  naming both versions and the upgrade command, instead of running
+  unknown-structure code paths. Same, older, and pre-versioning databases
+  open unchanged — additive idempotent migrations remain the forward
+  mechanism; this adds only the downgrade guard.
+
 ## [0.3.3] — 2026-07-04
 
 ### Added
