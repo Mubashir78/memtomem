@@ -84,7 +84,7 @@ See [Embeddings](docs/guides/embeddings.md) for the full model/provider matrix.
 "Remember this insight"      →  mem_add(content="...", tags=["ops"])
 ```
 
-> Prefer the terminal? `mm status` is a CLI mirror of `mem_status` — same output, no editor needed.
+> Prefer the terminal? `mm status` is a CLI mirror of `mem_status` — same output, no editor needed. Add `--json` (or `--format json`) for machine-readable output in scripts and CI.
 
 ### 4. Web UI (optional)
 
@@ -134,8 +134,10 @@ See [MCP Client Setup](docs/guides/mcp-clients.md) for Cursor / Windsurf / Claud
 - **Namespaces** — organize memories into scoped groups with auto-derivation from folder names; review and label them (colour, description) from Settings → Namespaces in the Web UI
 - **Maintenance** — near-duplicate detection, time-based decay, TTL expiration, auto-tagging
 - **Web UI** — visual dashboard for search, sources, tags, timeline, dedup, and more (`mm web --dev` for the full maintainer surface)
+- **Context Gateway** — author canonical Skills, Commands, and Subagents once in a wiki-backed Store, then sync them to your AI tools (each artifact type's supported runtimes); a Projects portal in the Web UI tracks per-project drift. See [Context Gateway](docs/guides/context-gateway.md).
 - **MCP tools** — `mem_do` meta-tool routes all non-core actions in `core` mode for minimal context usage
 - **Predictable surface** — memory operations fire only on explicit MCP tool calls (`mem_add`, `mem_index`, etc.), not from background hooks attached to every prompt or session-end. Less magic, fewer surprises.
+- **Scriptable CLI** — `--json` output on `mm status` and write commands (`mm add` / `mm reset` / `mm purge`); `mm warmup` pre-loads local models so the first query skips the cold-start cost
 - **Scheduled jobs** — `mm schedule add/list/run-now/delete` (or `mem_do(action="schedule_*")`) for cron-driven compaction, importance decay, dead-link cleanup, and dedup scans
 
 ---

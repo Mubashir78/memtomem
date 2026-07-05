@@ -247,7 +247,7 @@ mm index ~/notes                       # manual one-shot index (seed pre-existin
 mm index --debounce-window 5 PATH      # record PATH; drain entries silent ≥5s (hook callers)
 mm index --flush                       # synchronously drain queue (correctness primitive)
 mm index --status                      # snapshot queue depth + oldest entry
-mm add "note" --tags "tag1"            # add a memory
+mm add "note" --tags "tag1"            # add a memory (--json prints a machine-readable write ack)
 mm recall --since 2026-03-01           # recall by date (Validity column shown when chunks have valid_from/valid_to)
 
 # Configuration
@@ -259,6 +259,7 @@ mm reset                               # delete all data and reinitialize the DB
 mm reset --yes                         # skip confirmation prompt (safety gates still apply)
 mm reset --backup                      # snapshot the DB to <db>.pre-reset-<ts>.bak before wiping
 mm reset --force                       # bypass the liveness/write-lock gates (stale-pid recovery)
+mm reset --json                        # emit a machine-readable ack instead of prose (also on mm add / mm purge)
 mm upgrade                             # stop the running server, clear the stale pid, reinstall with --refresh
 mm upgrade --version 0.3.1 --dry-run   # preview a pinned upgrade (also: --grace, --extras, -y/--yes, --json)
 

@@ -29,7 +29,8 @@ for the reference as you need it.
 ## Power features
 
 6. **[Context Gateway](context-gateway.md)** — keep one Store of Skills,
-   Commands, and Subagents and sync it to every AI tool you use.
+   Commands, and Subagents and sync it to your AI tools (each artifact type's
+   supported runtimes).
 7. **[Multi-device sync](multi-device-sync.md)** — sync your markdown memories
    across personal devices via a private git repo.
 

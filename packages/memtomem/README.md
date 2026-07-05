@@ -50,7 +50,7 @@ Then in your AI editor, ask:
 "Remember this insight"      →  mem_add(content="...", tags=["ops"])
 ```
 
-> Prefer the terminal? `mm status` is a CLI mirror of `mem_status` — same output, no editor needed.
+> Prefer the terminal? `mm status` is a CLI mirror of `mem_status` — same output, no editor needed. Add `--json` (or `--format json`) for machine-readable output in scripts and CI.
 
 That's it. Your agent now has a long-term memory built from plain markdown files.
 
@@ -99,6 +99,8 @@ the editor: `~/.cursor/mcp.json` (Cursor),
 - **🧹 Maintenance** — near-duplicate detection with merge, time-based score decay, TTL expiration, auto-tagging
 - **🔄 Export / import** — JSON bundle backup and restore with re-embedding
 - **🌐 Web UI** — polished SPA dashboard for search, sources, indexing, tags, and timeline (`mm web --dev` unlocks the full maintainer surface including Sessions, Working Memory, and Health Report)
+- **🧭 Context Gateway** — author canonical Skills, Commands, and Subagents once in a wiki-backed Store (`mm wiki …`), then sync them to your AI tools (each artifact type's supported runtimes); a Projects portal in the Web UI tracks per-project drift
+- **⚙️ Scriptable CLI** — `--json` output on `mm status` and write commands (`mm add` / `mm reset` / `mm purge`); `mm warmup` pre-loads local models so the first query skips cold-start
 - **🛠️ 87 MCP tools** — full feature surface as MCP tools, with `mem_do` meta-tool routing all registered actions in `core` mode (default) for minimal context usage
 
 ## Documentation
@@ -111,6 +113,7 @@ Full documentation lives in the [memtomem GitHub repo](https://github.com/memtom
 | [Reference](https://github.com/memtomem/memtomem/blob/main/docs/guides/reference.md) | Complete feature reference — all tools and patterns |
 | [Configuration](https://github.com/memtomem/memtomem/blob/main/docs/guides/configuration.md) | All `MEMTOMEM_*` environment variables |
 | [Embeddings](https://github.com/memtomem/memtomem/blob/main/docs/guides/embeddings.md) | ONNX, Ollama, and OpenAI providers, model dimensions, switching models |
+| [Context Gateway](https://github.com/memtomem/memtomem/blob/main/docs/guides/context-gateway.md) | Author and sync canonical Skills, Commands, and Subagents to each type's supported AI tools |
 | [MCP Client Setup](https://github.com/memtomem/memtomem/blob/main/docs/guides/mcp-clients.md) | Editor-specific configuration |
 | [memtomem-stm](https://github.com/memtomem/memtomem-stm) | Optional STM proxy for proactive memory surfacing (separate package) |
 
