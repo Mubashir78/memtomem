@@ -111,6 +111,12 @@ async def _search(
             project_context_root=project_context_root,
         )
 
+    if not results and fmt != "json":
+        click.secho(
+            "No results found. See `mm status` to confirm your index has chunks.",
+            fg="yellow", err=True,
+        )
+
     if fmt == "context":
         if not results:
             return
