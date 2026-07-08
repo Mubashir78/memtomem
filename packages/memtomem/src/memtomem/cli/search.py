@@ -114,7 +114,8 @@ async def _search(
     if not results and fmt in ("table", "plain"):
         click.secho(
             "No results found. See `mm status` to confirm your index has chunks.",
-            fg="yellow", err=True,
+            fg="yellow",
+            err=True,
         )
 
     if fmt == "context":
